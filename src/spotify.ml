@@ -10,25 +10,186 @@
 open Lwt
 
 (* +-----------------------------------------------------------------+
+   | Shannon stream cipher                                           |
+   +-----------------------------------------------------------------+ *)
+
+type shn_ctx
+
+external shn_ctx_new : unit -> shn_ctx = "mlspot_shn_ctx_new"
+external shn_key : shn_ctx -> string -> int -> int -> unit = "mlspot_shn_key" "noalloc"
+external shn_nonce : shn_ctx -> string -> int -> int -> unit = "mlspot_shn_nonce" "noalloc"
+external shn_stream : shn_ctx -> string -> int -> int -> unit = "mlspot_shn_stream" "noalloc"
+external shn_maconly : shn_ctx -> string -> int -> int -> unit = "mlspot_shn_maconly" "noalloc"
+external shn_encrypt : shn_ctx -> string -> int -> int -> unit = "mlspot_shn_encrypt" "noalloc"
+external shn_decrypt : shn_ctx -> string -> int -> int -> unit = "mlspot_shn_decrypt" "noalloc"
+external shn_finish : shn_ctx -> string -> int -> int -> unit = "mlspot_shn_finish" "noalloc"
+
+(* +-----------------------------------------------------------------+
+   | Commands                                                        |
+   +-----------------------------------------------------------------+ *)
+
+type command =
+  | CMD_SECRETBLK
+  | CMD_PING
+  | CMD_CHANNELDATA
+  | CMD_CHANNELERR
+  | CMD_CHANNELABRT
+  | CMD_REQKEY
+  | CMD_AESKEY
+  | CMD_AESKEYERR
+  | CMD_SHAHASH
+  | CMD_IMAGE
+  | CMD_TOKENNOTIFY
+  | CMD_COUNTRYCODE
+  | CMD_P2P_SETUP
+  | CMD_P2P_INITBLK
+  | CMD_BROWSE
+  | CMD_SEARCH
+  | CMD_GETPLAYLIST
+  | CMD_CHANGEPLAYLIST
+  | CMD_NOTIFY
+  | CMD_LOG
+  | CMD_PONG
+  | CMD_PONGACK
+  | CMD_PAUSE
+  | CMD_REQUESTAD
+  | CMD_REQUESTPLAY
+  | CMD_PRODINFO
+  | CMD_WELCOME
+
+exception Unknown_command of int
+
+let string_of_command = function
+  | CMD_SECRETBLK -> "CMD_SECRETBLK"
+  | CMD_PING -> "CMD_PING"
+  | CMD_CHANNELDATA -> "CMD_CHANNELDATA"
+  | CMD_CHANNELERR -> "CMD_CHANNELERR"
+  | CMD_CHANNELABRT -> "CMD_CHANNELABRT"
+  | CMD_REQKEY -> "CMD_REQKEY"
+  | CMD_AESKEY -> "CMD_AESKEY"
+  | CMD_AESKEYERR -> "CMD_AESKEYERR"
+  | CMD_SHAHASH -> "CMD_SHAHASH"
+  | CMD_IMAGE -> "CMD_IMAGE"
+  | CMD_TOKENNOTIFY -> "CMD_TOKENNOTIFY"
+  | CMD_COUNTRYCODE -> "CMD_COUNTRYCODE"
+  | CMD_P2P_SETUP -> "CMD_P2P_SETUP"
+  | CMD_P2P_INITBLK -> "CMD_P2P_INITBLK"
+  | CMD_BROWSE -> "CMD_BROWSE"
+  | CMD_SEARCH -> "CMD_SEARCH"
+  | CMD_GETPLAYLIST -> "CMD_GETPLAYLIST"
+  | CMD_CHANGEPLAYLIST -> "CMD_CHANGEPLAYLIST"
+  | CMD_NOTIFY -> "CMD_NOTIFY"
+  | CMD_LOG -> "CMD_LOG"
+  | CMD_PONG -> "CMD_PONG"
+  | CMD_PONGACK -> "CMD_PONGACK"
+  | CMD_PAUSE -> "CMD_PAUSE"
+  | CMD_REQUESTAD -> "CMD_REQUESTAD"
+  | CMD_REQUESTPLAY -> "CMD_REQUESTPLAY"
+  | CMD_PRODINFO -> "CMD_PRODINFO"
+  | CMD_WELCOME -> "CMD_WELCOME"
+
+let command_of_int = function
+  | 0x02 -> CMD_SECRETBLK
+  | 0x04 -> CMD_PING
+  | 0x09 -> CMD_CHANNELDATA
+  | 0x0a -> CMD_CHANNELERR
+  | 0x0b -> CMD_CHANNELABRT
+  | 0x0c -> CMD_REQKEY
+  | 0x0d -> CMD_AESKEY
+  | 0x0e -> CMD_AESKEYERR
+  | 0x10 -> CMD_SHAHASH
+  | 0x19 -> CMD_IMAGE
+  | 0x1a -> CMD_TOKENNOTIFY
+  | 0x1b -> CMD_COUNTRYCODE
+  | 0x20 -> CMD_P2P_SETUP
+  | 0x21 -> CMD_P2P_INITBLK
+  | 0x30 -> CMD_BROWSE
+  | 0x31 -> CMD_SEARCH
+  | 0x35 -> CMD_GETPLAYLIST
+  | 0x36 -> CMD_CHANGEPLAYLIST
+  | 0x42 -> CMD_NOTIFY
+  | 0x48 -> CMD_LOG
+  | 0x49 -> CMD_PONG
+  | 0x4a -> CMD_PONGACK
+  | 0x4b -> CMD_PAUSE
+  | 0x4e -> CMD_REQUESTAD
+  | 0x4f -> CMD_REQUESTPLAY
+  | 0x50 -> CMD_PRODINFO
+  | 0x69 -> CMD_WELCOME
+  | cmd -> raise (Unknown_command cmd)
+
+let int_of_command = function
+  | CMD_SECRETBLK -> 0x02
+  | CMD_PING -> 0x04
+  | CMD_CHANNELDATA -> 0x09
+  | CMD_CHANNELERR -> 0x0a
+  | CMD_CHANNELABRT -> 0x0b
+  | CMD_REQKEY -> 0x0c
+  | CMD_AESKEY -> 0x0d
+  | CMD_AESKEYERR -> 0x0e
+  | CMD_SHAHASH -> 0x10
+  | CMD_IMAGE -> 0x19
+  | CMD_TOKENNOTIFY -> 0x1a
+  | CMD_COUNTRYCODE -> 0x1b
+  | CMD_P2P_SETUP -> 0x20
+  | CMD_P2P_INITBLK -> 0x21
+  | CMD_BROWSE -> 0x30
+  | CMD_SEARCH -> 0x31
+  | CMD_GETPLAYLIST -> 0x35
+  | CMD_CHANGEPLAYLIST -> 0x36
+  | CMD_NOTIFY -> 0x42
+  | CMD_LOG -> 0x48
+  | CMD_PONG -> 0x49
+  | CMD_PONGACK -> 0x4a
+  | CMD_PAUSE -> 0x4b
+  | CMD_REQUESTAD -> 0x4e
+  | CMD_REQUESTPLAY -> 0x4f
+  | CMD_PRODINFO -> 0x50
+  | CMD_WELCOME -> 0x69
+
+(* +-----------------------------------------------------------------+
    | Session                                                         |
    +-----------------------------------------------------------------+ *)
 
-type session = {
+exception Closed
+
+type session_parameters = {
   socket : Lwt_unix.file_descr;
   (* The socket used to communicate with the server. *)
 
   ic : Lwt_io.input_channel;
   oc : Lwt_io.output_channel;
 
-  key_send : string;
-  (* The key for sending packets. *)
+  shn_send : shn_ctx;
+  (* The shn context for sending packets. *)
 
-  key_recv : string;
-  (* The key for receiving packets. *)
+  shn_recv : shn_ctx;
+  (* The shn context for receiving packets. *)
 
-  mutable key_send_iv : int;
-  mutable key_recv_iv : int;
+  mutable send_iv : int;
+  (* Send init vector. *)
+
+  mutable recv_iv : int;
+  (* Recv init vector. *)
+
+  mutable next_channel_id : int;
+  (* Next ID for channels. *)
+
+  shutdown_waiter : (command * string) Lwt.t;
+  shutdown_wakener : (command * string) Lwt.u;
+  (* Thread waiting for the session to be closed. *)
 }
+
+class session (sp : session_parameters) = object
+  val mutable state = Some sp
+  method state = state
+  method get =
+    match state with
+      | None -> raise Closed
+      | Some sp -> sp
+  method close =
+    state <- None
+end
 
 (* +-----------------------------------------------------------------+
    | Service lookup                                                  |
@@ -114,6 +275,66 @@ module Packet = struct
   let send oc packet =
     Lwt_io.write_from_exactly oc packet.buf 0 packet.ofs
 end
+
+let send_packet sp command packet =
+  let nonce = String.create 4 in
+  let iv = sp.send_iv in
+  sp.send_iv <- iv + 1;
+  String.unsafe_set nonce 0 (Char.unsafe_chr (iv lsr 24));
+  String.unsafe_set nonce 1 (Char.unsafe_chr (iv lsr 16));
+  String.unsafe_set nonce 2 (Char.unsafe_chr (iv lsr 8));
+  String.unsafe_set nonce 3 (Char.unsafe_chr iv);
+  shn_nonce sp.shn_send nonce 0 4;
+  let len = Packet.length packet in
+  let buffer = String.create (3 + len + 4) in
+  String.unsafe_set buffer 0 (Char.unsafe_chr (int_of_command command));
+  String.unsafe_set buffer 1 (Char.unsafe_chr (len lsr 8));
+  String.unsafe_set buffer 2 (Char.unsafe_chr len);
+  String.blit packet.Packet.buf 0 buffer 3 packet.Packet.ofs;
+  shn_encrypt sp.shn_send buffer 0 (3 + len);
+  shn_finish sp.shn_send buffer (3 + len) 4;
+  Lwt_io.write_from_exactly sp.oc buffer 0 (3 + len + 4)
+
+let recv_packet sp =
+  let nonce = String.create 4 in
+  let iv = sp.recv_iv in
+  sp.recv_iv <- iv + 1;
+  String.unsafe_set nonce 0 (Char.unsafe_chr (iv lsr 24));
+  String.unsafe_set nonce 1 (Char.unsafe_chr (iv lsr 16));
+  String.unsafe_set nonce 2 (Char.unsafe_chr (iv lsr 8));
+  String.unsafe_set nonce 3 (Char.unsafe_chr iv);
+  shn_nonce sp.shn_recv nonce 0 4;
+  let header = String.create 3 in
+  lwt () = Lwt_io.read_into_exactly sp.ic header 0 3 in
+  shn_decrypt sp.shn_recv header 0 3;
+  let len = (Char.code (String.unsafe_get header 1) lsl 8) lor Char.code (String.unsafe_get header 2) in
+  let packet_len = len + 4 in
+  let payload = String.create packet_len in
+  lwt () = Lwt_io.read_into_exactly sp.ic payload 0 packet_len in
+  shn_decrypt sp.shn_recv payload 0 packet_len;
+  return (command_of_int (Char.code (String.unsafe_get header 0)), payload)
+
+(* +-----------------------------------------------------------------+
+   | Dispatching                                                     |
+   +-----------------------------------------------------------------+ *)
+
+let rec loop_dispatch sp =
+  lwt () =
+    try_lwt
+      lwt command, payload = pick [recv_packet sp; sp.shutdown_waiter] in
+      lwt () = Lwt_io.printlf "command %s received:" (string_of_command command) in
+      lwt () = Lwt_io.hexdump Lwt_io.stdout payload in
+      return ()
+    with
+      | Unknown_command command ->
+          ignore (Lwt_log.warning_f "unknown command received (0x%02x)" command);
+          return ()
+      | Closed ->
+          return ()
+      | exn ->
+          exit 1
+  in
+  loop_dispatch sp
 
 (* +-----------------------------------------------------------------+
    | Connection                                                      |
@@ -325,8 +546,11 @@ let connect ~username ~password =
       String.blit hmac 0 message 0 20
     done;
 
-    let key_send = String.sub hmac_output 20 32 in
-    let key_recv = String.sub hmac_output 52 32 in
+    let shn_send = shn_ctx_new () in
+    let shn_recv = shn_ctx_new () in
+    shn_key shn_send hmac_output 20 32;
+    shn_key shn_recv hmac_output 52 32;
+
     let key_hmac = String.sub hmac_output 0 20 in
 
     (* Solve the puzzle. *)
@@ -397,16 +621,84 @@ let connect ~username ~password =
     let payload = String.create payload_length in
     lwt () = Lwt_io.read_into_exactly ic payload 0 payload_length in
 
-    return {
+    let shutdown_waiter, shutdown_wakener = wait () in
+    let sp = {
       socket;
       ic;
       oc;
-      key_send;
-      key_recv;
-      key_send_iv = 0;
-      key_recv_iv = 0;
-    }
+      shn_send;
+      shn_recv;
+      send_iv = 0;
+      recv_iv = 0;
+      next_channel_id = 0;
+      shutdown_waiter;
+      shutdown_wakener;
+    } in
+    ignore (loop_dispatch sp);
+    return (new session sp)
   with exn ->
     Lwt_unix.shutdown socket Unix.SHUTDOWN_ALL;
     lwt () = Lwt_unix.close socket in
     raise_lwt exn
+
+let close session =
+  match session#state with
+    | None ->
+        return ()
+    | Some sp ->
+        session#close;
+        wakeup_exn sp.shutdown_wakener Closed;
+        lwt () = Lwt_io.flush sp.oc in
+        Lwt_unix.shutdown sp.socket Unix.SHUTDOWN_ALL;
+        Lwt_unix.close sp.socket
+
+(* +-----------------------------------------------------------------+
+   | IDs                                                             |
+   +-----------------------------------------------------------------+ *)
+
+type id = string
+
+exception Id_parse_failure
+exception Invalid_id_length
+
+let id_length = String.length
+
+let int_of_hexa = function
+  | '0' .. '9' as ch -> Char.code ch - Char.code '0'
+  | 'a' .. 'f' as ch -> Char.code ch - Char.code 'a' + 10
+  | 'A' .. 'F' as ch -> Char.code ch - Char.code 'A' + 10
+  | _ -> raise Id_parse_failure
+
+let id_of_string str =
+  let len = String.length str in
+  if len land 1 <> 0 then raise Id_parse_failure;
+  let id = String.create (len / 2) in
+  for i = 0 to len / 2 - 1 do
+    let x0 = int_of_hexa (String.unsafe_get str (i * 2 + 0)) in
+    let x1 = int_of_hexa (String.unsafe_get str (i * 2 + 1)) in
+    String.unsafe_set id i (Char.unsafe_chr ((x0 lsl 4) lor x1))
+  done;
+  id
+
+let hexa_of_int n =
+  if n < 10 then
+    Char.unsafe_chr (Char.code '0' + n)
+  else
+    Char.unsafe_chr (Char.code 'a' + n - 10)
+
+let string_of_id id =
+  let len = String.length id in
+  let str = String.create (len * 2) in
+  for i = 0 to len - 1 do
+    let x = Char.code (String.unsafe_get id i) in
+    String.unsafe_set str (i * 2 + 0) (hexa_of_int (x lsr 4));
+    String.unsafe_set str (i * 2 + 1) (hexa_of_int (x land 15))
+  done;
+  str
+
+(* +-----------------------------------------------------------------+
+   | Commands                                                        |
+   +-----------------------------------------------------------------+ *)
+
+let get_artist session id =
+  assert false

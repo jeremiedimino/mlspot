@@ -12,9 +12,44 @@
 type session
   (** Type of sessions. *)
 
+exception Closed
+  (** Exception raised when trying to use a closed session. *)
+
+(** {6 Connection} *)
+
 exception Connection_failure of string
   (** Exception raised when the connection failed. *)
 
 val connect : username : string -> password : string -> session Lwt.t
   (** [connect ~username ~password] connects to spotify using the
       given credentials. *)
+
+val close : session -> unit Lwt.t
+  (** Close the connection to a spotify server. *)
+
+(** {6 IDs} *)
+
+type id
+  (** Type of ids. *)
+
+exception Id_parse_failure
+  (** Exception when trying to parse an invalid ID. *)
+
+exception Invalid_id_length
+  (** Exception raised when using an ID of invalid length. *)
+
+val id_length : id -> int
+  (** Returns the length of the given ID. *)
+
+val id_of_string : string -> id
+  (** Convert a string to an ID. The string must be hexencoded and of
+      even length. *)
+
+val string_of_id : id -> string
+  (** Return the string representation of an ID. *)
+
+(** {6 Commands} *)
+
+val get_artist : session -> id -> string Lwt.t
+  (** [get_artist session id] returns the artist whose ID is
+      [id]. [id] must be of length 16. *)

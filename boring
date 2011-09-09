@@ -1,0 +1,4 @@
+(^|/)_build($|/)
+^mlspot-.*\.tar\.gz$
+^setup\.data$
+^setup\.log$

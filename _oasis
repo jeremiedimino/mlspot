@@ -1,0 +1,42 @@
+# +-------------------------------------------------------------------+
+# | Package parameters                                                |
+# +-------------------------------------------------------------------+
+
+OASISFormat: 0.1
+Name: mlspot
+Version: 1.0
+LicenseFile: LICENSE
+License: BSD3
+Authors: Jérémie Dimino
+Homepage: http://mlspot.forge.ocamlcore.org/
+BuildTools:ocamlbuild
+Plugins: DevFiles (0.2), META (0.2)
+Synopsis: A Spotify client library
+Description:
+  mlspot is a Spotify client library written in OCaml. It allow to
+  access spotify services.
+
+# +-------------------------------------------------------------------+
+# | The library                                                       |
+# +-------------------------------------------------------------------+
+
+Library mlspot
+  Path: src
+  Install: true
+  Modules: Spotify
+  CSources: dns_stubs.c
+  if !os_type(Win32)
+    CCLib: -lresolv
+  BuildDepends: lwt.unix, lwt.syntax, lwt.syntax.log, cryptokit
+  XMETARequires: lwt.unix, cryptokit
+  XMETADescription: Spotify client library
+
+# +-------------------------------------------------------------------+
+# | Misc                                                              |
+# +-------------------------------------------------------------------+
+
+SourceRepository head
+  Type: darcs
+  Location: http://darcs.ocamlcore.org/repos/mlspot
+  Browser: http://darcs.ocamlcore.org/cgi-bin/darcsweb.cgi?r=mlspot;a=summary
+

@@ -1,0 +1,7 @@
+# -*- conf -*-
+
+<**/*.ml>: syntax_camlp4o
+<src/*.c>: use_lwt_headers
+
+# OASIS_START
+# OASIS_STOP

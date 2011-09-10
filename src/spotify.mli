@@ -35,18 +35,27 @@ type id
 exception Id_parse_failure
   (** Exception when trying to parse an invalid ID. *)
 
-exception Invalid_id_length
-  (** Exception raised when using an ID of invalid length. *)
+exception Wrong_id of string
+  (** Exception raised when using an ID for a task which require an ID
+      of a different length. The argument is the kind of ID
+      expected. For example artist IDs are of length 16, if you try to
+      use {!get_artist} with an ID of length different than 16, then
+      [Wrong_id "artist"] will be raised. *)
 
 val id_length : id -> int
   (** Returns the length of the given ID. *)
 
 val id_of_string : string -> id
   (** Convert a string to an ID. The string must be hexencoded and of
-      even length. *)
+      even length. It raises {!Id_parse_failure} on errors. *)
 
 val string_of_id : id -> string
   (** Return the string representation of an ID. *)
+
+(** {6 Errors} *)
+
+exception Error of string
+  (** An error occured while receiving data. *)
 
 (** {6 Commands} *)
 

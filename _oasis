@@ -24,12 +24,25 @@ Library mlspot
   Path: src
   Install: true
   Modules: Spotify
-  CSources: dns_stubs.c, shn.h, shn.c, shn_stubs.c
+  CSources: dns_stubs.c, shn.h, shn.c, shn_stubs.c, z_stubs.c
   if !os_type(Win32)
-    CCLib: -lresolv
+    CCLib: -lresolv -lz
+  else
+    CCLib: -lz
   BuildDepends: lwt.unix, lwt.syntax, lwt.syntax.log, cryptokit
   XMETARequires: lwt.unix, cryptokit
   XMETADescription: Spotify client library
+
+# +-------------------------------------------------------------------+
+# | Examples                                                          |
+# +-------------------------------------------------------------------+
+
+Executable artistinfo
+  Path: examples
+  Install: false
+  MainIs: artistinfo.ml
+  CompiledObject: best
+  BuildDepends: mlspot, lwt.syntax
 
 # +-------------------------------------------------------------------+
 # | Misc                                                              |

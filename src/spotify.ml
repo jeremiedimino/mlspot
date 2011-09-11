@@ -786,8 +786,40 @@ let login session ~username ~password =
     let ic = Lwt_io.make ~mode:Lwt_io.input (Lwt_bytes.read socket)
     and oc = Lwt_io.make ~mode:Lwt_io.output (Lwt_bytes.write socket) in
 
+    (* Create a new random number generator.
+       [Cryptokit.Random.secure_rng] is far two slow, so we get some
+       random random bytes from /dev/random and complete with pseudo
+       random data. *)
+    let random = String.create 55 in
+    let offset =
+      try
+        let fd = Unix.openfile "/dev/random" [Unix.O_RDONLY; Unix.O_NONBLOCK] 0 in
+        begin
+          try
+            let offset = Unix.read fd random 0 (String.length random) in
+            Unix.close fd;
+            ignore (Lwt_log.info_f ~section "%d random bytes read from /dev/random" offset);
+            offset
+          with _ ->
+            ignore (Lwt_log.info_f ~section "0 random bytes read from /dev/random");
+            Unix.close fd;
+            0
+        end
+      with _ ->
+        0
+    in
+    if offset < String.length random then begin
+      let state = Random.State.make_self_init () in
+      for i = offset to String.length random - 1 do
+        random.[i] <- Char.unsafe_chr (Random.State.int state 256)
+      done;
+    end;
+
+    (* Create the random number generator. *)
+    let rng = Cryptokit.Random.pseudo_rng random in
+
     (* Generate random data. *)
-    let client_random = Cryptokit.Random.string Cryptokit.Random.secure_rng 16 in
+    let client_random = Cryptokit.Random.string rng 16 in
 
     (* The secure rng is two slow, so we use a pseudo-random one. *)
     let rng = Cryptokit.Random.pseudo_rng client_random in

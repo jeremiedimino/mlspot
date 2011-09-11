@@ -1221,6 +1221,16 @@ TAGS [
   "alternatives";
   "allowed";
   "explicit";
+  "artist-name";
+  "redirect";
+  "album-id";
+  "album-artist";
+  "album-artist-id";
+  "did-you-mean";
+  "total-artists";
+  "total-albums";
+  "total-tracks";
+  "result";
 ]
 
 let rec search_tag name a b =
@@ -1488,12 +1498,6 @@ XML disc = {
   "tracks" = new enum NODES (fun x -> new track x);
 }
 
-type album_type =
-  | ALBUM_TYPE_ALBUM
-  | ALBUM_TYPE_SINGLE
-  | ALBUM_TYPE_COMPILATION
-  | ALBUM_TYPE_UNKNOWN
-
 XML album = {
   "name" = DATA;
   "id" = id_of_string DATA;
@@ -1521,6 +1525,61 @@ XML artist = {
   "genres" = split ',' DATA;
   "years-active" = List.map int_of_string (split ',' DATA);
   "albums" = new enum (get_nodes tag_album NODE) (fun x -> new album x);
+}
+
+XML restriction_search = {
+  "catalogues" = split ',' DATA;
+  "forbidden" = (try split ',' DATA with Not_found -> []);
+  "allowed" = (try split ',' DATA with Not_found -> []);
+}
+
+XML artist_search = {
+  "id" = id_of_string DATA;
+  "name" = DATA;
+  "portrait" = new portrait NODE;
+  "popularity" = float_of_string DATA;
+  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction_search x);
+}
+
+XML album_search = {
+  "id" = id_of_string DATA;
+  "name" = DATA;
+  "artist" = get_data tag_artist_name node;
+  "artist-id" = id_of_string DATA;
+  "cover" = id_of_string DATA;
+  "popularity" = float_of_string DATA;
+  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction_search x);
+  "external-ids" = new enum (get_nodes tag_external_id NODE) (fun x -> (get_data tag_type x, get_data tag_id x));
+}
+
+XML track_search = {
+  "id" = id_of_string DATA;
+  "redirect" = id_of_string DATA;
+  "title" = DATA;
+  "artist" = DATA;
+  "artist_id" = id_of_string DATA;
+  "album" = DATA;
+  "album-id" = id_of_string DATA;
+  "album-artist" = DATA;
+  "album-artist-id" = id_of_string DATA;
+  "year" = int_of_string DATA;
+  "track-number" = int_of_string DATA;
+  "length" = float (int_of_string DATA) /. 1000.;
+  "files" = new enum (get_nodes tag_file NODE) (fun x -> new file x);
+  "cover" = id_of_string DATA;
+  "popularity" = float_of_string DATA;
+  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction_search x);
+  "external-ids" = new enum (get_nodes tag_external_id NODE) (fun x -> (get_data tag_type x, get_data tag_id x));
+}
+
+XML search_result = {
+  "did-you-mean" = (try Some DATA with Not_found -> None);
+  "total-artists" = int_of_string DATA;
+  "total-albums" = int_of_string DATA;
+  "total-tracks" = int_of_string DATA;
+  "artists" = new enum (get_nodes tag_artist NODE) (fun x -> new artist_search x);
+  "albums" = new enum (get_nodes tag_album NODE) (fun x -> new album_search x);
+  "tracks" = new enum (get_nodes tag_track NODE) (fun x -> new track_search x);
 }
 
 (* +-----------------------------------------------------------------+
@@ -1566,7 +1625,7 @@ let search session ?(offset = 0) ?(length = 1000) query =
     Packet.add_string packet query;
     lwt () = send_packet session#session_parameters CMD_SEARCH (Packet.contents packet) in
     lwt data = channel_waiter in
-    return (inflate data)
+    return (new search_result (parse_xml tag_result (inflate data)))
   finally
     release_channel session#session_parameters channel_id;
     return ()

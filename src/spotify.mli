@@ -224,15 +224,46 @@ class type artist = object
   method albums : album enum
 end
 
-(** {6 Commands} *)
+class type artist_search = object
+  method id : id
+  method name : string
+  method portrait : portrait
+  method popularity : float
+  method restrictions : restriction enum
+end
 
-val get_artist : session -> id -> artist Lwt.t
-  (** [get_artist session id] returns the artist whose ID is
-      [id]. [id] must be of length 16. *)
+class type album_search = object
+  method id : id
+  method name : string
+  method artist : string
+  method artist_id : id
+  method cover : id
+  method popularity : float
+  method restrictions : restriction enum
+  method external_ids : (string * string) enum
+end
 
-(** {6 Search} *)
+class type track_search = object
+  method id : id
+  method redirect : id
+  method title : string
+  method artist : string
+  method artist_id : id
+  method album : string
+  method album_id : string
+  method album_artist : string
+  method album_artist_id : string
+  method year : int
+  method track_number : int
+  method length : float
+  method files : file enum
+  method cover : id
+  method popularity : float
+  method restrictions : restriction enum
+  method external_ids : (string * string) enum
+end
 
-(*class search_result = object
+class type search_result = object
   method did_you_mean : string option
     (** Suggestion. *)
 
@@ -247,7 +278,18 @@ val get_artist : session -> id -> artist Lwt.t
 
   method artists : artist_search enum
   method albums : album_search enum
-  method tracks : track enum
+  method tracks : track_search enum
 end
-*)
-val search : session -> ?offset : int -> ?length : int -> string -> string Lwt.t
+
+(** {6 Commands} *)
+
+val get_artist : session -> id -> artist Lwt.t
+  (** [get_artist session id] returns the artist whose ID is
+      [id]. [id] must be of length 16. *)
+
+val search : session -> ?offset : int -> ?length : int -> string -> search_result Lwt.t
+  (** [search session ?offset ?length query] performs the given
+      search. [offset] represent the offset the first response to get
+      in the list of all response. It default to [0]. [length] is the
+      maximum number of responses to return. It default to [1000]. *)
+

@@ -43,10 +43,10 @@ Library "pa_xml"
 # | Examples                                                          |
 # +-------------------------------------------------------------------+
 
-Executable artistinfo
+Executable search
   Path: examples
   Install: false
-  MainIs: artistinfo.ml
+  MainIs: search.ml
   CompiledObject: best
   BuildDepends: mlspot, lwt.syntax
 

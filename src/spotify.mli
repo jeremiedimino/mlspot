@@ -181,13 +181,20 @@ end
 
 class type track = object
   method id : id
+  method redirect : id
   method title : string
   method explicit : bool
   method artist : string
   method artist_id : id
+  method album : string
+  method album_id : string
+  method album_artist : string
+  method album_artist_id : string
+  method year : int
   method track_number : int
   method length : float
   method files : file enum
+  method cover : id
   method popularity : float
   method external_ids : (string * string) enum
   method alternatives : alternative enum
@@ -243,26 +250,6 @@ class type album_search = object
   method external_ids : (string * string) enum
 end
 
-class type track_search = object
-  method id : id
-  method redirect : id
-  method title : string
-  method artist : string
-  method artist_id : id
-  method album : string
-  method album_id : string
-  method album_artist : string
-  method album_artist_id : string
-  method year : int
-  method track_number : int
-  method length : float
-  method files : file enum
-  method cover : id
-  method popularity : float
-  method restrictions : restriction enum
-  method external_ids : (string * string) enum
-end
-
 class type search_result = object
   method did_you_mean : string option
     (** Suggestion. *)
@@ -278,7 +265,7 @@ class type search_result = object
 
   method artists : artist_search enum
   method albums : album_search enum
-  method tracks : track_search enum
+  method tracks : track enum
 end
 
 (** {6 Commands} *)
@@ -286,6 +273,18 @@ end
 val get_artist : session -> id -> artist Lwt.t
   (** [get_artist session id] returns the artist whose ID is
       [id]. [id] must be of length 16. *)
+
+val get_album : session -> id -> album Lwt.t
+  (** [get_album session id] returns the album whose ID is [id]. [id]
+      must be of length 16. *)
+
+val get_track : session -> id -> track Lwt.t
+  (** [get_track session id] returns the track whose ID is [id]. [id]
+      must be of length 16. *)
+
+val get_tracks : session -> id list -> track enum Lwt.t
+  (** [get_track session ids] returns the tracks whose ID are
+      [ids]. [ids] must all be of length 16. *)
 
 val search : session -> ?offset : int -> ?length : int -> string -> search_result Lwt.t
   (** [search session ?offset ?length query] performs the given

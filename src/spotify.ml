@@ -1432,6 +1432,19 @@ let split sep str =
   in
   loop 0 0
 
+let split_space_coma str =
+  let rec loop i j =
+    if j = String.length str then
+      [String.sub str i (j - i)]
+    else
+      match str.[j] with
+        | ' ' | ',' ->
+            String.sub str i (j - i) :: loop (j + 1) (j + 1)
+        | _ ->
+            loop i (j + 1)
+  in
+  loop 0 0
+
 XML portrait = {
   "id" = id_of_string DATA;
   "width" = int_of_string DATA;
@@ -1445,8 +1458,8 @@ XML bio = {
 
 XML restriction = {
   "catalogues" = split ',' DATA;
-  "forbidden" = (try split ' ' DATA with Not_found -> []);
-  "allowed" = (try split ' ' DATA with Not_found -> []);
+  "forbidden" = (try split_space_coma DATA with Not_found -> []);
+  "allowed" = (try split_space_coma DATA with Not_found -> []);
 }
 
 XML similar_artist = {
@@ -1480,13 +1493,20 @@ XML alternative = {
 
 XML track = {
   "id" = id_of_string DATA;
+  "redirect" = id_of_string DATA;
   "title" = DATA;
   "explicit" = DATA = "true";
   "artist" = DATA;
   "artist-id" = id_of_string DATA;
+  "album" = DATA;
+  "album-id" = id_of_string DATA;
+  "album-artist" = DATA;
+  "album-artist-id" = id_of_string DATA;
   "track-number" = int_of_string DATA;
   "length" = float (int_of_string DATA) /. 1000.;
   "files" = new enum (get_nodes tag_file NODE) (fun x -> new file x);
+  "cover" = id_of_string DATA;
+  "year" = int_of_string DATA;
   "popularity" = float_of_string DATA;
   "external-ids" = new enum (get_nodes tag_external_id NODE) (fun x -> (get_data tag_type x, get_data tag_id x));
   "alternatives" = new enum (try get_nodes tag_track NODE with Not_found -> [||]) (fun x -> new alternative x)
@@ -1527,18 +1547,12 @@ XML artist = {
   "albums" = new enum (get_nodes tag_album NODE) (fun x -> new album x);
 }
 
-XML restriction_search = {
-  "catalogues" = split ',' DATA;
-  "forbidden" = (try split ',' DATA with Not_found -> []);
-  "allowed" = (try split ',' DATA with Not_found -> []);
-}
-
 XML artist_search = {
   "id" = id_of_string DATA;
   "name" = DATA;
   "portrait" = new portrait NODE;
   "popularity" = float_of_string DATA;
-  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction_search x);
+  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction x);
 }
 
 XML album_search = {
@@ -1548,27 +1562,7 @@ XML album_search = {
   "artist-id" = id_of_string DATA;
   "cover" = id_of_string DATA;
   "popularity" = float_of_string DATA;
-  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction_search x);
-  "external-ids" = new enum (get_nodes tag_external_id NODE) (fun x -> (get_data tag_type x, get_data tag_id x));
-}
-
-XML track_search = {
-  "id" = id_of_string DATA;
-  "redirect" = id_of_string DATA;
-  "title" = DATA;
-  "artist" = DATA;
-  "artist_id" = id_of_string DATA;
-  "album" = DATA;
-  "album-id" = id_of_string DATA;
-  "album-artist" = DATA;
-  "album-artist-id" = id_of_string DATA;
-  "year" = int_of_string DATA;
-  "track-number" = int_of_string DATA;
-  "length" = float (int_of_string DATA) /. 1000.;
-  "files" = new enum (get_nodes tag_file NODE) (fun x -> new file x);
-  "cover" = id_of_string DATA;
-  "popularity" = float_of_string DATA;
-  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction_search x);
+  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction x);
   "external-ids" = new enum (get_nodes tag_external_id NODE) (fun x -> (get_data tag_type x, get_data tag_id x));
 }
 
@@ -1579,7 +1573,7 @@ XML search_result = {
   "total-tracks" = int_of_string DATA;
   "artists" = new enum (get_nodes tag_artist NODE) (fun x -> new artist_search x);
   "albums" = new enum (get_nodes tag_album NODE) (fun x -> new album_search x);
-  "tracks" = new enum (get_nodes tag_track NODE) (fun x -> new track_search x);
+  "tracks" = new enum (get_nodes tag_track NODE) (fun x -> new track x);
 }
 
 (* +-----------------------------------------------------------------+
@@ -1588,28 +1582,40 @@ XML search_result = {
 
 external inflate : string -> string = "mlspot_inflate"
 
-let get_artist session id =
-  if id_length id <> 16 then raise (Wrong_id "artist");
-  let cache_file = make_filename ["metadata"; "artists"; string_of_id id ^ ".xml.gz"] in
+let browse session ids kind kind_id root xml =
+  if List.exists (fun id -> id_length id <> 16) ids then raise (Wrong_id kind);
+(*  let cache_files = List.map (fun id -> make_filename ["metadata"; kind ^ "s"; string_of_id id ^ ".xml.gz"]) ids in
   match_lwt Cache.load session cache_file with
     | Some data ->
-        return (new artist (parse_xml tag_artist (inflate data)))
-    | None ->
+        return (xml (parse_xml root (inflate data)))
+    | None ->*)
         lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
         try_lwt
           let packet = Packet.create () in
           Packet.add_int16 packet channel_id;
-          (* Kind of the browse query: 1 = arstist. *)
-          Packet.add_int8 packet 1;
-          Packet.add_string packet id;
-          Packet.add_int32 packet 0;
+          Packet.add_int8 packet kind_id;
+          List.iter (Packet.add_string packet) ids;
+          if kind_id = 1 || kind_id = 2 then Packet.add_int32 packet 0;
           lwt () = send_packet session#session_parameters CMD_BROWSE (Packet.contents packet) in
           lwt data = channel_waiter in
-          lwt () = Cache.save session cache_file data in
-          return (new artist (parse_xml tag_artist (inflate data)))
+(*          lwt () = Cache.save session cache_file data in*)
+          return (xml (parse_xml root (inflate data)))
         finally
           release_channel session#session_parameters channel_id;
           return ()
+
+let get_artist session id =
+  browse session [id] "artist" 1 tag_artist (fun x -> new artist x)
+
+let get_album session id =
+  browse session [id] "album" 2 tag_album (fun x -> new album x)
+
+let get_tracks session ids =
+  browse session ids "track" 3 tag_result (fun x -> (new search_result x)#tracks)
+
+let get_track session id =
+  lwt tracks = get_tracks session [id] in
+  return (tracks#get 0)
 
 let search session ?(offset = 0) ?(length = 1000) query =
   let len = String.length query in

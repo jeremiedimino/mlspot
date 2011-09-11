@@ -21,7 +21,14 @@ let () =
              Options.make_links := false
 
          | After_rules ->
-             flag ["c"; "compile"; "use_lwt_headers"] & S[A"-package"; A"lwt"]
+             (* Add the lwt package for C files. *)
+             flag ["c"; "compile"; "use_lwt_headers"] & S[A"-package"; A"lwt"];
+
+             (* Internal syntax extension *)
+             flag ["ocaml"; "compile"; "pa_xml"] & S[A"-ppopt"; A "syntax/pa_xml.cmo"];
+             flag ["ocaml"; "ocamldep"; "pa_xml"] & S[A"-ppopt"; A "syntax/pa_xml.cmo"];
+             flag ["ocaml"; "doc"; "pa_xml"] & S[A"-ppopt"; A "syntax/pa_xml.cmo"];
+             dep ["ocaml"; "ocamldep"; "pa_xml"] ["syntax/pa_xml.cmo"]
 
          | _ ->
              ())

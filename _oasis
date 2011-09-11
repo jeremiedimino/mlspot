@@ -30,8 +30,14 @@ Library mlspot
   else
     CCLib: -lz
   BuildDepends: lwt.unix, lwt.syntax, lwt.syntax.log, cryptokit, expat
-  XMETARequires: lwt.unix, cryptokit, xmlm
+  XMETARequires: lwt.unix, cryptokit, expat
   XMETADescription: Spotify client library
+
+Library "pa_xml"
+  Install: false
+  Path: syntax
+  Modules: Pa_xml
+  BuildDepends: camlp4.lib, camlp4.quotations.o, camlp4.extend
 
 # +-------------------------------------------------------------------+
 # | Examples                                                          |

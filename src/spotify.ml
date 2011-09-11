@@ -1162,86 +1162,98 @@ end
    | XML                                                             |
    +-----------------------------------------------------------------+ *)
 
-module Tag = struct
-  (* We create a big weak table of all encountered tags in order to
-     save memory: two equal tags are represented by the same physical
-     string. *)
-  module Tags = Weak.Make (struct
-                             type t = string
-                             let equal = ( = )
-                             let hash = Hashtbl.hash
-                           end)
+TAGS [
+  "id";
+  "width";
+  "height";
+  "name";
+  "genres";
+  "years-active";
+  "artist";
+  "artists";
+  "portrait";
+]
 
-  let tags = Tags.create 16384
+let rec search_tag name a b =
+  if a = b then
+    raise Not_found
+  else
+    let c = (a + b) / 2 in
+    let name' = Array.unsafe_get tags c in
+    match String.compare name name' with
+      | n when n < 0 ->
+          search_tag name a c
+      | n when n > 0 ->
+          search_tag name (c + 1) b
+      | _ ->
+          c
 
-  let make tag = Tags.merge tags tag
-end
+let make_tag name = search_tag name 0 (Array.length tags)
 
 module Tag_map = Map.Make (struct
-                             type t = string
-                             let compare a b =
-                               if a == b then
-                                 0
-                               else
-                                 String.compare a b
+                             type t = int
+                             let compare a b = a - b
                            end)
 
 type data = string
-    (* Type of attributes and PCDATA. *)
+    (* Type of attributes and CDATA. *)
+
+type 'a store = {
+  mutable size : int;
+  mutable elts : 'a list;
+}
 
 type node = {
-  nodes : (string * node array) array;
-  (* Sorted array of children which contains XML nodes. *)
-  datas : (string * data array) array;
-  (* Sorted array of data. It is either attributes of the node, or
-     childlren containing only one pcdata. *)
+  mutable nodes : node store Tag_map.t;
+  (* Children, by tags. *)
+  mutable datas : data store Tag_map.t;
+  (* Children containing only one CDATA, by tags as well as
+     attributes. *)
 }
 
 let empty = {
-  nodes = [||];
-  datas = [||];
+  nodes = Tag_map.empty;
+  datas = Tag_map.empty;
 }
 
-type 'a store = {
-  mutable store_size : int;
-  mutable store_data : 'a list;
-}
-
-type 'a map = {
-  mutable map_size : int;
-  mutable map_data : 'a store Tag_map.t;
-}
-
-let new_map () = { map_size = 0; map_data = Tag_map.empty }
-
-let add name data map =
-  let name = Tag.make name in
+let add name elt map =
   try
-    let store = Tag_map.find name map.map_data in
-    store.store_size <- store.store_size + 1;
-    store.store_data <- data :: store.store_data;
+    let tag = make_tag name in
+    try
+      let store = Tag_map.find tag map in
+      store.size <- store.size + 1;
+      store.elts <- elt :: store.elts;
+      map
+    with Not_found ->
+      Tag_map.add tag { size = 1; elts = [elt] } map
   with Not_found ->
-    map.map_size <- map.map_size + 1;
-    map.map_data <- Tag_map.add name { store_size = 1; store_data = [data] } map.map_data
+    map
 
-let rec rev_fill arr idx l =
-  match l with
+let rec rev_fill arr idx elts =
+  match elts with
     | [] ->
         ()
-    | x :: l ->
+    | x :: elts ->
         arr.(idx) <- x;
-        rev_fill arr (idx - 1) l
+        rev_fill arr (idx - 1) elts
 
 let array_of_store store =
-  let arr = Array.make store.store_size (List.hd store.store_data) in
-  rev_fill arr (store.store_size - 1) store.store_data;
+  let arr = Array.make store.size (List.hd store.elts) in
+  rev_fill arr (store.size - 1) store.elts;
   arr
 
-let array_of_map map =
-  let arr = Array.make map.map_size ("", [||]) in
-  let idx = ref 0 in
-  Tag_map.iter (fun name store -> arr.(!idx) <- (name, array_of_store store)) map.map_data;
-  arr
+let get_datas tag node = array_of_store (Tag_map.find tag node.datas)
+let get_nodes tag node = array_of_store (Tag_map.find tag node.nodes)
+
+let get_data tag node =
+  match (Tag_map.find tag node.datas).elts with
+    | [x] -> x
+    | _ -> raise (Error "wrong number of data")
+
+let get_node tag node =
+  match (Tag_map.find tag node.nodes).elts with
+    | [x] -> x
+    | _ -> raise (Error "wrong number of node")
 
 type data_maker = {
   mutable data_size : int;
@@ -1262,7 +1274,7 @@ let make_data dm =
   in
   loop dm.data_size dm.data_data
 
-type state = Undefined | Data of data_maker | Node of node map * data map
+type state = Undefined | Data of data_maker | Node of node
 
 let is_space str =
   let rec loop idx =
@@ -1277,40 +1289,52 @@ let is_space str =
   in
   loop 0
 
+let rec print_xml indent node =
+  Tag_map.iter
+    (fun tag store ->
+       Printf.printf "%s%s = [%s]\n" indent tags.(tag) (String.concat "; " (List.rev_map (Printf.sprintf "%S") store.elts)))
+    node.datas;
+  Tag_map.iter
+    (fun tag store ->
+       Printf.printf "%s%s = {\n" indent tags.(tag);
+       List.iter (print_xml ("  " ^ indent)) (List.rev store.elts);
+       Printf.printf "%s}\n" indent)
+    node.nodes
+
 let parse_xml root str =
   let xp = Expat.parser_create None in
+  let node = { nodes = Tag_map.empty; datas = Tag_map.empty } in
   let stack = ref [] in
-  let state = ref Undefined in
+  let state = ref (Node node) in
   Expat.set_start_element_handler xp
     (fun name attrs ->
        match !state with
          | Undefined ->
-             stack := (new_map (), new_map ()) :: !stack;
-             state := Undefined
+             stack := { nodes = Tag_map.empty; datas = Tag_map.empty } :: !stack
          | Data str ->
              raise (Error "cannot mix element and cdata")
-         | Node (nodes, datas) ->
-             stack := (nodes, datas) :: !stack;
+         | Node node ->
+             stack := node :: !stack;
              state := Undefined);
   Expat.set_end_element_handler xp
     (fun name ->
-       let nodes, datas =
+       let node =
          match !stack with
            | [] ->
                assert false
-           | (nodes, datas) :: rest ->
+           | node :: rest ->
                stack := rest;
-               (nodes, datas)
+               node
        in
-       state := Node (nodes, datas);
-       match !state with
+       let old_state = !state in
+       state := Node node;
+       match old_state with
          | Undefined ->
-             add name empty nodes
+             node.nodes <- add name empty node.nodes
          | Data dm ->
-             add name (make_data dm) datas
-         | Node (nodes', datas') ->
-             let node = { nodes = array_of_map nodes'; datas = array_of_map datas' } in
-             add name node nodes);
+             node.datas <- add name (make_data dm) node.datas
+         | Node node' ->
+             node.nodes <- add name node' node.nodes);
   Expat.set_character_data_handler xp
     (fun str ->
        match !state with
@@ -1324,75 +1348,16 @@ let parse_xml root str =
   try
     Expat.parse xp str;
     Expat.final xp;
-    assert (!stack = []);
-    match !state with
-      | Undefined ->
-          raise (Error "empty XML")
-      | Data str ->
-          raise (Error "XML contains only cdata")
-      | Node (nodes, datas) ->
-          if nodes.map_size <> 1 then
-            raise (Error "XML contains too many root nodes");
-          if datas.map_size <> 0 then
-            raise (Error "XML contains cdata at root");
-          try
-            let store = Tag_map.find root nodes.map_data in
-            if store.store_size <> 1 then
-              raise (Error "XML contains too many root nodes");
-            List.hd store.store_data
-          with Not_found ->
-            raise (Error "invalid root of XML")
+    try
+      get_node root node
+    with Not_found ->
+      raise (Error "invalid XML")
   with Expat.Expat_error error ->
     raise (Error (Expat.xml_error_to_string error))
 
-let bsearch (key : string) arr =
-  let rec loop a b =
-    if a = b then
-      raise Not_found
-    else
-      let c = (a + b / 2) in
-      let key', value = Array.unsafe_get arr c in
-      if key == key' then
-        value
-      else if key < key' then
-        loop a c
-      else
-        loop (c + 1) b
-  in
-  loop 0 (Array.length arr)
-
-let get_datas name node = bsearch name node.datas
-let get_nodes name node = bsearch name node.nodes
-
-let get_data name node =
-  match get_datas name node with
-    | [|x|] -> x
-    | _ -> raise (Error "wrong number of data")
-
-let get_node name node =
-  match get_nodes name node with
-    | [|x|] -> x
-    | _ -> raise (Error "wrong number of node")
-
 (* +-----------------------------------------------------------------+
-   | All used tags                                                   |
+   | Documents                                                       |
    +-----------------------------------------------------------------+ *)
-
-let tag_id = Tag.make "id"
-let tag_width = Tag.make "width"
-let tag_height = Tag.make "height"
-let tag_name = Tag.make "name"
-let tag_genres = Tag.make "genres"
-let tag_years_active = Tag.make "years-active"
-let tag_artist = Tag.make "artist"
-let tag_artists = Tag.make "artists"
-let tag_portrait = Tag.make "portrait"
-
-(* +-----------------------------------------------------------------+
-   | Commands                                                        |
-   +-----------------------------------------------------------------+ *)
-
-external inflate : string -> string = "mlspot_inflate"
 
 let split_coma str =
   let rec loop i j =
@@ -1407,19 +1372,25 @@ let split_coma str =
   in
   loop 0 0
 
-class portrait node = object
-  method id = id_of_string (get_data tag_id node)
-  method width = int_of_string (get_data tag_width node)
-  method height = int_of_string (get_data tag_height node)
-end
+XML portrait = {
+  "id" = id_of_string DATA;
+  "width" = int_of_string DATA;
+  "height" = int_of_string DATA;
+}
 
-class artist node = object
-  method name = get_data tag_name node
-  method id = id_of_string (get_data tag_id node)
-  method portrait = new portrait (get_node tag_portrait node)
-  method genres = split_coma (get_data tag_genres node)
-  method years_active = List.map int_of_string (split_coma (get_data tag_years_active node))
-end
+XML artist = {
+  "name" = DATA;
+  "id" = id_of_string DATA;
+  "portrait" = new portrait NODE;
+  "genres" = split_coma DATA;
+  "years-active" = List.map int_of_string (split_coma DATA);
+}
+
+(* +-----------------------------------------------------------------+
+   | Commands                                                        |
+   +-----------------------------------------------------------------+ *)
+
+external inflate : string -> string = "mlspot_inflate"
 
 let get_artist session id =
   if id_length id <> 16 then raise (Wrong_id "artist");

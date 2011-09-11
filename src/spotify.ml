@@ -1168,7 +1168,7 @@ module Tag = struct
      string. *)
   module Tags = Weak.Make (struct
                              type t = string
-                             let equal = ( == )
+                             let equal = ( = )
                              let hash = Hashtbl.hash
                            end)
 
@@ -1243,62 +1243,107 @@ let array_of_map map =
   Tag_map.iter (fun name store -> arr.(!idx) <- (name, array_of_store store)) map.map_data;
   arr
 
-let parse_xml root str =
-  let input = Xmlm.make_input ~strip:true (`String (0, str)) in
-  (* Parse the root node. *)
-  let rec parse_root () =
-    match Xmlm.input input with
-      | `El_start ((_, name), _) ->
-          if name <> root then raise (Error "invalid XML root");
-          (* Ignore the name of the root, just parses its children as
-             a list of nodes. *)
-          parse_list (new_map ()) (new_map ())
-      | `El_end ->
-          raise (Error "invalid start of XML")
-      | `Data str ->
-          raise (Error "unexpected PCDATA at beginning of XML")
-      | `Dtd _ ->
-          parse_root ()
+type data_maker = {
+  mutable data_size : int;
+  mutable data_data : string list;
+}
 
-  (* Parse a sequence of nodes. *)
-  and parse_list nodes datas =
-    match Xmlm.input input with
-      | `El_start ((_, name), _) -> begin
-          match Xmlm.peek input with
-            | `El_start _ ->
-                let node = parse_list (new_map ()) (new_map ()) in
-                add name node nodes;
-                parse_list nodes datas
-            | `El_end ->
-                ignore (Xmlm.input input);
-                add name empty nodes;
-                parse_list nodes datas
-            | `Data str -> begin
-                ignore (Xmlm.input input);
-                match Xmlm.input input with
-                  | `El_end ->
-                      add name str datas;
-                      parse_list nodes datas
-                  | _ ->
-                      raise (Error "expected end of element after PCDATA in XML")
-              end
-            | `Dtd _ ->
-                raise (Error "unexpected DTD in middle of XML")
-        end
-      | `El_end ->
-          {
-            nodes = array_of_map nodes;
-            datas = array_of_map datas;
-          }
-      | `Data str ->
-          raise (Error "unexpected PCDATA in middle of node list in XML")
-      | `Dtd _ ->
-          raise (Error "unexpected DTD in middle of XML")
+let make_data dm =
+  let res = String.create dm.data_size in
+  let rec loop ofs l =
+    match l with
+      | [] ->
+          res
+      | str :: l ->
+          let len = String.length str in
+          let ofs = ofs - len in
+          String.unsafe_blit str 0 res ofs len;
+          loop ofs l
   in
+  loop dm.data_size dm.data_data
+
+type state = Undefined | Data of data_maker | Node of node map * data map
+
+let is_space str =
+  let rec loop idx =
+    if idx = String.length str then
+      true
+    else
+      match String.unsafe_get str idx with
+        | ' ' | '\t' | '\n' ->
+            loop (idx + 1)
+        | _ ->
+            false
+  in
+  loop 0
+
+let parse_xml root str =
+  let xp = Expat.parser_create None in
+  let stack = ref [] in
+  let state = ref Undefined in
+  Expat.set_start_element_handler xp
+    (fun name attrs ->
+       match !state with
+         | Undefined ->
+             stack := (new_map (), new_map ()) :: !stack;
+             state := Undefined
+         | Data str ->
+             raise (Error "cannot mix element and cdata")
+         | Node (nodes, datas) ->
+             stack := (nodes, datas) :: !stack;
+             state := Undefined);
+  Expat.set_end_element_handler xp
+    (fun name ->
+       let nodes, datas =
+         match !stack with
+           | [] ->
+               assert false
+           | (nodes, datas) :: rest ->
+               stack := rest;
+               (nodes, datas)
+       in
+       state := Node (nodes, datas);
+       match !state with
+         | Undefined ->
+             add name empty nodes
+         | Data dm ->
+             add name (make_data dm) datas
+         | Node (nodes', datas') ->
+             let node = { nodes = array_of_map nodes'; datas = array_of_map datas' } in
+             add name node nodes);
+  Expat.set_character_data_handler xp
+    (fun str ->
+       match !state with
+         | Undefined ->
+             if not (is_space str) then state := Data { data_size = String.length str; data_data = [str] }
+         | Data dm ->
+             dm.data_size <- dm.data_size + String.length str;
+             dm.data_data <- str :: dm.data_data
+         | Node _ ->
+             if not (is_space str) then raise (Error "cannot mix elements and cdata"));
   try
-    parse_root ()
-  with Xmlm.Error (pos, error) ->
-    raise (Error ("invalid XML: " ^ Xmlm.error_message error))
+    Expat.parse xp str;
+    Expat.final xp;
+    assert (!stack = []);
+    match !state with
+      | Undefined ->
+          raise (Error "empty XML")
+      | Data str ->
+          raise (Error "XML contains only cdata")
+      | Node (nodes, datas) ->
+          if nodes.map_size <> 1 then
+            raise (Error "XML contains too many root nodes");
+          if datas.map_size <> 0 then
+            raise (Error "XML contains cdata at root");
+          try
+            let store = Tag_map.find root nodes.map_data in
+            if store.store_size <> 1 then
+              raise (Error "XML contains too many root nodes");
+            List.hd store.store_data
+          with Not_found ->
+            raise (Error "invalid root of XML")
+  with Expat.Expat_error error ->
+    raise (Error (Expat.xml_error_to_string error))
 
 let bsearch (key : string) arr =
   let rec loop a b =

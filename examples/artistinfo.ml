@@ -18,9 +18,10 @@ lwt () =
   (* Connect to spotify. *)
   lwt session = Spotify.connect ~username:Sys.argv.(1) ~password:Sys.argv.(2) in
 
-  (* Get artist informations. *)
-  lwt str = Spotify.get_artist session (Spotify.id_of_string Sys.argv.(3)) in
+  lwt search = Spotify.search session "tina arena" in
+  print_endline search;
 
-  lwt () = Lwt_io.print str in
+  (* Get artist informations. *)
+(*  lwt artist = Spotify.get_artist session (Spotify.id_of_string Sys.argv.(3)) in*)
 
   return ()

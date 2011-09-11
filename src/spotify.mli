@@ -57,8 +57,24 @@ val string_of_id : id -> string
 exception Error of string
   (** An error occured while receiving data. *)
 
-(** {6 Commands} *)
+(** {6 Artists} *)
 
-val get_artist : session -> id -> string Lwt.t
+class type portrait = object
+  method id : id
+  method width : int
+  method height : int
+end
+
+class type artist = object
+  method name : string
+  method id : id
+  method portrait : portrait
+  method genres : string list
+  method years_active : int list
+end
+
+val get_artist : session -> id -> artist Lwt.t
   (** [get_artist session id] returns the artist whose ID is
       [id]. [id] must be of length 16. *)
+
+val search : session -> ?offset : int -> ?length : int -> string -> string Lwt.t

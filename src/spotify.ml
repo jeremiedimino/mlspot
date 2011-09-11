@@ -980,6 +980,101 @@ let string_of_id id =
 
 external inflate : string -> string = "mlspot_inflate"
 
+let split_coma str =
+  let rec loop i j =
+    if j = String.length str then
+      [String.sub str i (j - i)]
+    else
+      match str.[j] with
+        | ',' ->
+            String.sub str i (j - i) :: loop (j + 1) (j + 1)
+        | _ ->
+            loop i (j + 1)
+  in
+  loop 0 0
+
+module String_map = Map.Make(String)
+
+type data = string
+
+type node = {
+  nodes : node String_map.t;
+  datas : data String_map.t;
+}
+
+let empty = {
+  nodes = String_map.empty;
+  datas = String_map.empty;
+}
+
+let parse_xml root str =
+  let input = Xmlm.make_input ~strip:true (`String (0, str)) in
+  (* Parse the root node. *)
+  let rec parse_root () =
+    match Xmlm.input input with
+      | `El_start ((_, name), _) ->
+          if name <> root then raise (Error "invalid XML root");
+          (* Ignore the name of the root, just parses its children as
+             a list of nodes. *)
+          parse_list String_map.empty String_map.empty
+      | `El_end ->
+          raise (Error "invalid start of XML")
+      | `Data str ->
+          raise (Error "unexpected PCDATA at beginning of XML")
+      | `Dtd _ ->
+          parse_root ()
+
+  (* Parse a sequence of nodes. *)
+  and parse_list nodes datas =
+    match Xmlm.input input with
+      | `El_start ((_, name), _) -> begin
+          match Xmlm.peek input with
+            | `El_start _ ->
+                let node = parse_list String_map.empty String_map.empty in
+                parse_list (String_map.add name node nodes) datas
+            | `El_end ->
+                ignore (Xmlm.input input);
+                parse_list (String_map.add name empty nodes) datas
+            | `Data str -> begin
+                ignore (Xmlm.input input);
+                match Xmlm.input input with
+                  | `El_end ->
+                      parse_list nodes (String_map.add name str datas)
+                  | _ ->
+                      raise (Error "expected end of element after PCDATA in XML")
+              end
+            | `Dtd _ ->
+                raise (Error "unexpected DTD in middle of XML")
+        end
+      | `El_end ->
+          { nodes; datas }
+      | `Data str ->
+          raise (Error "unexpected PCDATA in middle of node list in XML")
+      | `Dtd _ ->
+          raise (Error "unexpected DTD in middle of XML")
+  in
+  try
+    parse_root ()
+  with Xmlm.Error (pos, error) ->
+    raise (Error ("invalid XML: " ^ Xmlm.error_message error))
+
+let get_data name node = String_map.find name node.datas
+let get_node name node = String_map.find name node.nodes
+
+class portrait node = object
+  method id = id_of_string (get_data "id" node)
+  method width = int_of_string (get_data "width" node)
+  method height = int_of_string (get_data "height" node)
+end
+
+class artist node = object
+  method name = get_data "name" node
+  method id = id_of_string (get_data "id" node)
+  method portrait = new portrait (get_node "portrait" node)
+  method genres = split_coma (get_data "genres" node)
+  method years_active = List.map int_of_string (split_coma (get_data "years-active" node))
+end
+
 let get_artist session id =
   if id_length id <> 16 then raise (Wrong_id "artist");
   lwt channel_id, channel_packet, channel_waiter = alloc_channel session#get in
@@ -991,6 +1086,25 @@ let get_artist session id =
     Packet.add_string packet id;
     Packet.add_int32 packet 0;
     lwt () = send_packet session#get CMD_BROWSE (Packet.contents packet) in
+    lwt data = channel_waiter in
+    return (new artist (parse_xml "artist" (inflate data)))
+  finally
+    release_channel session#get channel_id;
+    return ()
+
+let search session ?(offset = 0) ?(length = 1000) query =
+  let len = String.length query in
+  if len > 255 then invalid_arg "Spotify.search";
+  lwt channel_id, channel_packet, channel_waiter = alloc_channel session#get in
+  try_lwt
+    let packet = Packet.create () in
+    Packet.add_int16 packet channel_id;
+    Packet.add_int32 packet offset;
+    Packet.add_int32 packet length;
+    Packet.add_int16 packet 0;
+    Packet.add_int8 packet len;
+    Packet.add_string packet query;
+    lwt () = send_packet session#get CMD_SEARCH (Packet.contents packet) in
     lwt data = channel_waiter in
     return (inflate data)
   finally

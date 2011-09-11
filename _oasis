@@ -29,8 +29,8 @@ Library mlspot
     CCLib: -lresolv -lz
   else
     CCLib: -lz
-  BuildDepends: lwt.unix, lwt.syntax, lwt.syntax.log, cryptokit
-  XMETARequires: lwt.unix, cryptokit
+  BuildDepends: lwt.unix, lwt.syntax, lwt.syntax.log, cryptokit, xmlm
+  XMETARequires: lwt.unix, cryptokit, xmlm
   XMETADescription: Spotify client library
 
 # +-------------------------------------------------------------------+

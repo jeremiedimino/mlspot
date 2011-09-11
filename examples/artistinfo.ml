@@ -15,13 +15,14 @@ lwt () =
     exit 2
   end;
 
-  (* Connect to spotify. *)
-  lwt session = Spotify.connect ~username:Sys.argv.(1) ~password:Sys.argv.(2) in
+  let session = Spotify.create () in
 
-  lwt search = Spotify.search session "tina arena" in
-  print_endline search;
+  (* Connect to spotify. *)
+  lwt () = Spotify.login session ~username:Sys.argv.(1) ~password:Sys.argv.(2) in
+
+(*  lwt search = Spotify.search session "tina aren" in*)
 
   (* Get artist informations. *)
-(*  lwt artist = Spotify.get_artist session (Spotify.id_of_string Sys.argv.(3)) in*)
+  lwt artist = Spotify.get_artist session (Spotify.id_of_string Sys.argv.(3)) in
 
   return ()

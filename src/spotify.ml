@@ -9,7 +9,29 @@
 
 open Lwt
 
+let section = Lwt_log.Section.make "spotify"
+
+let xdg_cache_home =
+  try
+    Sys.getenv "XDG_CACHE_HOME"
+  with Not_found ->
+    let home = try Sys.getenv "HOME" with Not_found -> (Unix.getpwuid (Unix.getuid ())).Unix.pw_dir in
+    if Sys.os_type = "Win32" then
+      Filename.concat (Filename.concat home "Local Settings") "Cache"
+    else
+      Filename.concat home ".cache"
+
+(* +-----------------------------------------------------------------+
+   | Errors                                                          |
+   +-----------------------------------------------------------------+ *)
+
+exception Offline
+exception Logged_out
+exception Disconnected
+exception Connection_failure of string
+exception Authentication_failure of string
 exception Error of string
+
 let () = Callback.register_exception "mlspot:error" (Error "")
 
 (* +-----------------------------------------------------------------+
@@ -346,8 +368,6 @@ let int_of_command = function
    | Session                                                         |
    +-----------------------------------------------------------------+ *)
 
-exception Closed
-
 module Channel_map = Map.Make (struct type t = int let compare a b = a - b end)
 
 (* Information about a channel. *)
@@ -359,12 +379,20 @@ type channel = {
   (* Wakener for when the packet is terminated. *)
 }
 
+(* Parameters for online sessions. *)
 type session_parameters = {
+  mutable disconnected : bool;
+  (* Whether the session has been disconnected. In this case [socket]
+     has been closed and [logout_wakener] has been wakeup. *)
+
   socket : Lwt_unix.file_descr;
   (* The socket used to communicate with the server. *)
 
   ic : Lwt_io.input_channel;
+  (* The input channel used to receive data from the server. *)
+
   oc : Lwt_io.output_channel;
+  (* The output channel used to send data to the server. *)
 
   shn_send : shn_ctx;
   (* The shn context for sending packets. *)
@@ -388,36 +416,53 @@ type session_parameters = {
   channel_released : unit Lwt_condition.t;
   (* Condition signaled when a channel becomes available. *)
 
-  shutdown_waiter : unit Lwt.t;
-  shutdown_wakener : unit Lwt.u;
-  (* Thread waiting for the session to be closed. *)
-
   login_waiter : unit Lwt.t;
   login_wakener : unit Lwt.u;
   (* Thread wakeuped when the login is complete. *)
+
+  logout_waiter : unit Lwt.t;
+  logout_wakener : unit Lwt.u;
+  (* Thread waiting for the session to be closed. *)
 }
 
-(* Wrapper around session parameters. We use a wrapper to be sure that
-   no reference is hold when the session is closed. The wrapper is an
-   object so session are comparable and hashable. *)
-class session (sp : session_parameters) = object
-  val mutable state = Some sp
-  method state = state
-  method get =
-    match state with
-      | None -> raise Closed
+(* Sessions are objects so they are comparable and hashable. *)
+class session ?(use_cache = true) ?(cache_dir = Filename.concat xdg_cache_home "mlspot") () = object
+  val mutable session_parameters : session_parameters option = None
+    (* Session parameters for online sessions. *)
+
+  method session_parameters =
+    match session_parameters with
       | Some sp -> sp
-  method close =
-    state <- None
+      | None -> raise Offline
+
+  method get_session_parameters = session_parameters
+  method set_session_parameters sp = session_parameters <- sp
+
+  val mutable config_use_cache = use_cache
+  method get_use_cache = config_use_cache
+  method set_use_cache x = config_use_cache <- x
+
+  val mutable config_cache_dir = cache_dir
+  method get_cache_dir = config_cache_dir
+  method set_cache_dir x = config_cache_dir <- x
 end
+
+let create ?use_cache ?cache_dir () = new session ?use_cache ?cache_dir ()
+let online session = session#get_session_parameters <> None
+
+let get_use_cache session = session#get_use_cache
+let set_use_cache session x = session#set_use_cache x
+
+let get_cache_dir session = session#get_cache_dir
+let set_cache_dir session x = session#set_cache_dir x
 
 (* +-----------------------------------------------------------------+
    | Utils                                                           |
    +-----------------------------------------------------------------+ *)
 
 (* Return a thread which fails when the session is closed. *)
-let or_shutdown sp w =
-  pick [w; sp.shutdown_waiter >> fail Exit]
+let or_logout sp w =
+  pick [w; sp.logout_waiter >> fail Exit]
 
 (* +-----------------------------------------------------------------+
    | Channels                                                        |
@@ -440,7 +485,7 @@ let alloc_channel sp =
       let packet = Packet.create () in
       let waiter, wakener = task () in
       sp.channels <- Channel_map.add id { ch_data = []; ch_wakener = wakener } sp.channels;
-      Some (id, packet, or_shutdown sp waiter)
+      Some (id, packet, or_logout sp waiter)
     end;
   in
   let rec wait_for_id () =
@@ -450,7 +495,7 @@ let alloc_channel sp =
       | None ->
           (* Wait for either a channel to be released, or the session
              to be closed. *)
-          lwt () = or_shutdown sp (Lwt_condition.wait sp.channel_released) in
+          lwt () = or_logout sp (Lwt_condition.wait sp.channel_released) in
           wait_for_id ()
   in
   wait_for_id ()
@@ -480,7 +525,7 @@ let send_packet sp command packet =
   String.unsafe_blit packet 0 buffer 3 len;
   shn_encrypt sp.shn_send buffer 0 (3 + len);
   shn_finish sp.shn_send buffer (3 + len) 4;
-  Lwt_io.write_from_exactly sp.oc buffer 0 (3 + len + 4)
+  or_logout sp (Lwt_io.write_from_exactly sp.oc buffer 0 (3 + len + 4))
 
 (* Read one packet using the given session parameters.
 
@@ -493,14 +538,50 @@ let recv_packet sp =
   put_int32 nonce 0 iv;
   shn_nonce sp.shn_recv nonce 0 4;
   let header = String.create 3 in
-  lwt () = Lwt_io.read_into_exactly sp.ic header 0 3 in
+  lwt () = or_logout sp (Lwt_io.read_into_exactly sp.ic header 0 3) in
   shn_decrypt sp.shn_recv header 0 3;
   let len = get_int16 header 1 in
   let packet_len = len + 4 in
   let payload = String.create packet_len in
-  lwt () = Lwt_io.read_into_exactly sp.ic payload 0 packet_len in
+  lwt () = or_logout sp (Lwt_io.read_into_exactly sp.ic payload 0 packet_len) in
   shn_decrypt sp.shn_recv payload 0 packet_len;
   return (command_of_int (Char.code (String.unsafe_get header 0)), String.sub payload 0 len)
+
+(* +-----------------------------------------------------------------+
+   | Cache                                                           |
+   +-----------------------------------------------------------------+ *)
+
+module Cache = struct
+  let load session name =
+    if session#get_use_cache then
+      let filename = Filename.concat session#get_cache_dir name in
+      try_lwt
+        Lwt_io.with_file ~mode:Lwt_io.input filename Lwt_io.read >|= fun x -> Some x
+      with exn ->
+        ignore (Lwt_log.debug_f ~exn "failed to load %S from the cache" name);
+        return None
+    else
+      return None
+
+  let save session name data =
+    if session#get_use_cache then
+      let filename = Filename.concat session#get_cache_dir name in
+      try_lwt
+        let rec loop dir =
+          try_lwt
+            Lwt_unix.access dir [Unix.F_OK]
+          with Unix.Unix_error _ ->
+            lwt () = loop (Filename.dirname dir) in
+            Lwt_unix.mkdir dir 0o755
+        in
+        lwt () = loop (Filename.dirname filename) in
+        Lwt_io.with_file ~mode:Lwt_io.output filename (fun oc -> Lwt_io.write oc data)
+      with exn ->
+        ignore (Lwt_log.error_f ~exn "failed to save %S to the cache" name);
+        return ()
+    else
+      return ()
+end
 
 (* +-----------------------------------------------------------------+
    | Dispatching                                                     |
@@ -520,13 +601,13 @@ let dispatch sp command payload =
 
     | CMD_CHANNEL_DATA ->
         if String.length payload < 2 then
-          Lwt_log.error "invalid channel data received"
+          Lwt_log.error ~section "invalid channel data received"
         else begin
           (* Read the channel id. *)
           let id = get_int16 payload 0 in
           match try Some (Channel_map.find id sp.channels) with Not_found -> None with
             | None ->
-                Lwt_log.error "channel data from unknown channel received"
+                Lwt_log.error ~section "channel data from unknown channel received"
 
             | Some channel ->
                 if String.length payload = 2 then begin
@@ -568,13 +649,13 @@ let dispatch sp command payload =
 
     | CMD_CHANNEL_ERROR ->
         if String.length payload < 2 then
-          Lwt_log.error "invalid channel error received"
+          Lwt_log.error ~section "invalid channel error received"
         else begin
           (* Read the channel id. *)
           let id = get_int16 payload 0 in
           match try Some (Channel_map.find id sp.channels) with Not_found -> None with
             | None ->
-                Lwt_log.error "channel error from unknown channel received"
+                Lwt_log.error ~section "channel error from unknown channel received"
 
             | Some channel ->
                 release_channel sp id;
@@ -587,33 +668,47 @@ let dispatch sp command payload =
         return ()
 
     | _ ->
-        Lwt_log.warning_f "do not know what to do with command '%s'" (string_of_command command)
+        Lwt_log.warning_f ~section "do not know what to do with command '%s'" (string_of_command command)
+
+let disconnect sp =
+  if not sp.disconnected then begin
+    sp.disconnected <- true;
+    wakeup_exn sp.logout_wakener Disconnected;
+    try_lwt
+      Lwt_io.flush sp.oc
+    finally
+      Lwt_unix.shutdown sp.socket Unix.SHUTDOWN_ALL;
+      Lwt_unix.close sp.socket
+  end else
+    return ()
 
 let rec loop_dispatch sp =
   lwt () =
     try_lwt
-      lwt command, payload = or_shutdown sp (recv_packet sp) in
+      lwt command, payload = recv_packet sp in
       ignore (
         try_lwt
           dispatch sp command payload
         with exn ->
-          Lwt_log.error ~exn "dispatcher failed with"
+          Lwt_log.error ~section ~exn "dispatcher failed with"
       );
       return ()
     with
       | Unknown_command command ->
-          ignore (Lwt_log.error_f "unknown command received (0x%02x)" command);
+          ignore (Lwt_log.error_f ~section "unknown command received (0x%02x)" command);
           return ()
-      | Closed ->
+      | Logged_out | Disconnected ->
           return ()
+      | End_of_file ->
+          disconnect sp
       | exn ->
-          ignore (Lwt_log.error ~exn "command reader failed with");
-          exit 1
+          ignore (Lwt_log.error ~section ~exn "command reader failed with");
+          disconnect sp
   in
   loop_dispatch sp
 
 (* +-----------------------------------------------------------------+
-   | Connection                                                      |
+   | Loggin/logout                                                   |
    +-----------------------------------------------------------------+ *)
 
 exception Connection_failure of string
@@ -630,60 +725,78 @@ let dh_parameters = {
   Cryptokit.DH.privlen = 160;
 }
 
-let connect ~username ~password =
-  (* Service lookup. *)
-  lwt servers =
+let logout session =
+  match session#get_session_parameters with
+    | None ->
+        return ()
+    | Some sp ->
+        session#set_session_parameters None;
+        disconnect sp
+
+let login session ~username ~password =
+  lwt () = logout session in
+
+  lwt socket =
     try_lwt
-      service_lookup ()
-    with Unix.Unix_error (err, _, _) ->
-      ignore (Lwt_log.warning_f "service lookup failed: %s" (Unix.error_message err));
-      return [(0, "ap.spotify.com", 4070)]
+      (* Service lookup. *)
+      lwt servers =
+        try_lwt
+          service_lookup ()
+        with Unix.Unix_error (error, _, _) ->
+          ignore (Lwt_log.warning_f ~section "service lookup failed: %s" (Unix.error_message error));
+          return [(0, "ap.spotify.com", 4070)]
+      in
+
+      (* Sort servers. *)
+      let servers = List.sort (fun (prio1, _, _) (prio2, _, _) -> prio1 - prio2) servers in
+
+      (* Read address informations. *)
+      lwt address_infos =
+        Lwt_list.map_p
+          (fun (priority, host, port) ->
+             Lwt_unix.getaddrinfo host (string_of_int port) [Unix.AI_SOCKTYPE Unix.SOCK_STREAM; Unix.AI_PROTOCOL 0])
+          servers
+        >|= List.flatten
+      in
+
+      (* Try to connect to a server. *)
+      let rec loop address_infos =
+        match address_infos with
+          | [] ->
+              raise_lwt (Connection_failure "no server available")
+          | address_info :: address_infos ->
+              let sock = Lwt_unix.socket address_info.Unix.ai_family address_info.Unix.ai_socktype address_info.Unix.ai_protocol in
+              try_lwt
+                (* Try to connect. *)
+                lwt () = Lwt_unix.connect sock address_info.Unix.ai_addr in
+                return sock
+              with Unix.Unix_error _ ->
+                lwt () = Lwt_unix.close sock in
+                (* Try other addresses. *)
+                loop address_infos
+      in
+
+      loop address_infos
+
+    with Unix.Unix_error (error, _, _) ->
+      raise_lwt (Connection_failure (Unix.error_message error))
   in
-
-  (* Sort servers. *)
-  let servers = List.sort (fun (prio1, _, _) (prio2, _, _) -> prio1 - prio2) servers in
-
-  (* Read address informations. *)
-  lwt address_infos =
-    Lwt_list.map_p
-      (fun (priority, host, port) ->
-         Lwt_unix.getaddrinfo host (string_of_int port) [Unix.AI_SOCKTYPE Unix.SOCK_STREAM; Unix.AI_PROTOCOL 0])
-      servers
-    >|= List.flatten
-  in
-
-  (* Try to connect to a server. *)
-  let rec loop address_infos =
-    match address_infos with
-      | [] ->
-          raise_lwt (Connection_failure "cannot connect to any server")
-      | address_info :: address_infos ->
-          let sock = Lwt_unix.socket address_info.Unix.ai_family address_info.Unix.ai_socktype address_info.Unix.ai_protocol in
-          try_lwt
-            (* Try to connect. *)
-            lwt () = Lwt_unix.connect sock address_info.Unix.ai_addr in
-            return sock
-          with Unix.Unix_error _ ->
-            lwt () = Lwt_unix.close sock in
-            (* Try other addresses. *)
-            loop address_infos
-  in
-
-  lwt socket = loop address_infos in
 
   try_lwt
     let ic = Lwt_io.make ~mode:Lwt_io.input (Lwt_bytes.read socket)
     and oc = Lwt_io.make ~mode:Lwt_io.output (Lwt_bytes.write socket) in
 
-    let rng = Cryptokit.Random.pseudo_rng "lkjsdflksjizejijqklsjflksqjflksnqk,nklndqlk,klqnfd" in
-
     (* Generate random data. *)
-    let client_random = Cryptokit.Random.string rng 16 in
+    let client_random = Cryptokit.Random.string Cryptokit.Random.secure_rng 16 in
+
+    (* The secure rng is two slow, so we use a pseudo-random one. *)
+    let rng = Cryptokit.Random.pseudo_rng client_random in
 
     (* Generate a secret. *)
     let secret = Cryptokit.DH.private_secret ~rng dh_parameters in
 
-    (* Generate a new RSA key. *)
+    (* Generate a new RSA key (TODO: use a more secure random number
+       generator, the secure one is too slow). *)
     let rsa = Cryptokit.RSA.new_key ~rng ~e:65537 1024 in
 
     (* Forge the initial packet. *)
@@ -741,12 +854,12 @@ let connect ~username ~password =
 
     if server_random.[0] <> '\x00' then begin
       match server_random.[1] with
-        | '\x01' -> raise (Connection_failure "client upgrade recquired")
-        | '\x03' -> raise (Connection_failure "user not found")
-        | '\x04' -> raise (Connection_failure "account has been disabled")
-        | '\x06' -> raise (Connection_failure "you need to complete your account details")
-        | '\x09' -> raise (Connection_failure "country mismatch")
-        | _ -> raise (Connection_failure "unknown error")
+        | '\x01' -> raise (Authentication_failure "client upgrade recquired")
+        | '\x03' -> raise (Authentication_failure "user not found")
+        | '\x04' -> raise (Authentication_failure "account has been disabled")
+        | '\x06' -> raise (Authentication_failure "you need to complete your account details")
+        | '\x09' -> raise (Authentication_failure "country mismatch")
+        | _ -> raise (Authentication_failure "unknown error")
     end;
 
     (* Read remaining 14 random bytes. *)
@@ -797,7 +910,7 @@ let connect ~username ~password =
     let init_server = Packet.contents packet in
 
     if String.length puzzle < 6 || puzzle.[0] <> '\x01' then
-      raise (Connection_failure "unexpected puzzle challenge");
+      raise (Authentication_failure "unexpected puzzle challenge");
     let denominator = 1 lsl (Char.code puzzle.[1]) - 1 in
     let magic = get_int32 puzzle 2 in
 
@@ -884,7 +997,7 @@ let connect ~username ~password =
 
     (* Read the response. *)
     lwt status = Lwt_io.read_char ic >|= Char.code in
-    if status <> 0 then raise (Connection_failure "authentication failed");
+    if status <> 0 then raise (Authentication_failure "authentication failed");
 
     (* Read the payload length. *)
     lwt payload_length = Lwt_io.read_char ic >|= Char.code in
@@ -893,9 +1006,10 @@ let connect ~username ~password =
     let payload = String.create payload_length in
     lwt () = Lwt_io.read_into_exactly ic payload 0 payload_length in
 
-    let shutdown_waiter, shutdown_wakener = wait () in
     let login_waiter, login_wakener = task () in
+    let logout_waiter, logout_wakener = wait () in
     let sp = {
+      disconnected = false;
       socket;
       ic;
       oc;
@@ -906,29 +1020,29 @@ let connect ~username ~password =
       channels = Channel_map.empty;
       next_channel_id = 0;
       channel_released = Lwt_condition.create ();
-      shutdown_waiter;
-      shutdown_wakener;
       login_waiter;
       login_wakener;
+      logout_waiter;
+      logout_wakener;
     } in
+
+    (* Start the dispatcher. *)
     ignore (loop_dispatch sp);
-    lwt () = login_waiter in
-    return (new session sp)
+
+    try_lwt
+      lwt () = login_waiter in
+      session#set_session_parameters (Some sp);
+      return ()
+
+    with exn ->
+      (* Make sure the dispatcher exit. *)
+      wakeup_exn logout_wakener Logged_out;
+      raise_lwt exn
+
   with exn ->
     Lwt_unix.shutdown socket Unix.SHUTDOWN_ALL;
     lwt () = Lwt_unix.close socket in
     raise_lwt exn
-
-let close session =
-  match session#state with
-    | None ->
-        return ()
-    | Some sp ->
-        session#close;
-        wakeup_exn sp.shutdown_wakener Closed;
-        lwt () = Lwt_io.flush sp.oc in
-        Lwt_unix.shutdown sp.socket Unix.SHUTDOWN_ALL;
-        Lwt_unix.close sp.socket
 
 (* +-----------------------------------------------------------------+
    | IDs                                                             |
@@ -975,6 +1089,229 @@ let string_of_id id =
   str
 
 (* +-----------------------------------------------------------------+
+   | Enumerations                                                    |
+   +-----------------------------------------------------------------+ *)
+
+exception Out_of_bounds
+
+class ['a] enum arr map = object
+  method length = Array.length arr
+
+  method get idx =
+    if idx < 0 || idx >= Array.length arr then raise Out_of_bounds;
+    map (Array.unsafe_get arr idx)
+
+  method to_list =
+    let rec loop idx acc =
+      if idx = -1 then
+        acc
+      else
+        loop (idx - 1) (map (Array.unsafe_get arr idx) :: acc)
+    in
+    loop (Array.length arr) []
+
+  method to_array =
+    Array.map map arr
+
+  method iter (f : 'a -> unit) =
+    for idx = 0 to Array.length arr - 1 do
+      f (map (Array.unsafe_get arr idx))
+    done
+
+  method fold : 'b. ('a -> 'b -> 'b) -> 'b -> 'b = fun f acc ->
+    let acc = ref acc in
+    for idx = 0 to Array.length arr - 1 do
+      acc := f (map (Array.unsafe_get arr idx)) !acc
+    done;
+    !acc
+end
+
+(* +-----------------------------------------------------------------+
+   | XML                                                             |
+   +-----------------------------------------------------------------+ *)
+
+module Tag = struct
+  (* We create a big weak table of all encountered tags in order to
+     save memory: two equal tags are represented by the same physical
+     string. *)
+  module Tags = Weak.Make (struct
+                             type t = string
+                             let equal = ( == )
+                             let hash = Hashtbl.hash
+                           end)
+
+  let tags = Tags.create 16384
+
+  let make tag = Tags.merge tags tag
+end
+
+module Tag_map = Map.Make (struct
+                             type t = string
+                             let compare a b =
+                               if a == b then
+                                 0
+                               else
+                                 String.compare a b
+                           end)
+
+type data = string
+    (* Type of attributes and PCDATA. *)
+
+type node = {
+  nodes : (string * node array) array;
+  (* Sorted array of children which contains XML nodes. *)
+  datas : (string * data array) array;
+  (* Sorted array of data. It is either attributes of the node, or
+     childlren containing only one pcdata. *)
+}
+
+let empty = {
+  nodes = [||];
+  datas = [||];
+}
+
+type 'a store = {
+  mutable store_size : int;
+  mutable store_data : 'a list;
+}
+
+type 'a map = {
+  mutable map_size : int;
+  mutable map_data : 'a store Tag_map.t;
+}
+
+let new_map () = { map_size = 0; map_data = Tag_map.empty }
+
+let add name data map =
+  let name = Tag.make name in
+  try
+    let store = Tag_map.find name map.map_data in
+    store.store_size <- store.store_size + 1;
+    store.store_data <- data :: store.store_data;
+  with Not_found ->
+    map.map_size <- map.map_size + 1;
+    map.map_data <- Tag_map.add name { store_size = 1; store_data = [data] } map.map_data
+
+let rec rev_fill arr idx l =
+  match l with
+    | [] ->
+        ()
+    | x :: l ->
+        arr.(idx) <- x;
+        rev_fill arr (idx - 1) l
+
+let array_of_store store =
+  let arr = Array.make store.store_size (List.hd store.store_data) in
+  rev_fill arr (store.store_size - 1) store.store_data;
+  arr
+
+let array_of_map map =
+  let arr = Array.make map.map_size ("", [||]) in
+  let idx = ref 0 in
+  Tag_map.iter (fun name store -> arr.(!idx) <- (name, array_of_store store)) map.map_data;
+  arr
+
+let parse_xml root str =
+  let input = Xmlm.make_input ~strip:true (`String (0, str)) in
+  (* Parse the root node. *)
+  let rec parse_root () =
+    match Xmlm.input input with
+      | `El_start ((_, name), _) ->
+          if name <> root then raise (Error "invalid XML root");
+          (* Ignore the name of the root, just parses its children as
+             a list of nodes. *)
+          parse_list (new_map ()) (new_map ())
+      | `El_end ->
+          raise (Error "invalid start of XML")
+      | `Data str ->
+          raise (Error "unexpected PCDATA at beginning of XML")
+      | `Dtd _ ->
+          parse_root ()
+
+  (* Parse a sequence of nodes. *)
+  and parse_list nodes datas =
+    match Xmlm.input input with
+      | `El_start ((_, name), _) -> begin
+          match Xmlm.peek input with
+            | `El_start _ ->
+                let node = parse_list (new_map ()) (new_map ()) in
+                add name node nodes;
+                parse_list nodes datas
+            | `El_end ->
+                ignore (Xmlm.input input);
+                add name empty nodes;
+                parse_list nodes datas
+            | `Data str -> begin
+                ignore (Xmlm.input input);
+                match Xmlm.input input with
+                  | `El_end ->
+                      add name str datas;
+                      parse_list nodes datas
+                  | _ ->
+                      raise (Error "expected end of element after PCDATA in XML")
+              end
+            | `Dtd _ ->
+                raise (Error "unexpected DTD in middle of XML")
+        end
+      | `El_end ->
+          {
+            nodes = array_of_map nodes;
+            datas = array_of_map datas;
+          }
+      | `Data str ->
+          raise (Error "unexpected PCDATA in middle of node list in XML")
+      | `Dtd _ ->
+          raise (Error "unexpected DTD in middle of XML")
+  in
+  try
+    parse_root ()
+  with Xmlm.Error (pos, error) ->
+    raise (Error ("invalid XML: " ^ Xmlm.error_message error))
+
+let bsearch (key : string) arr =
+  let rec loop a b =
+    if a = b then
+      raise Not_found
+    else
+      let c = (a + b / 2) in
+      let key', value = Array.unsafe_get arr c in
+      if key == key' then
+        value
+      else if key < key' then
+        loop a c
+      else
+        loop (c + 1) b
+  in
+  loop 0 (Array.length arr)
+
+let get_datas name node = bsearch name node.datas
+let get_nodes name node = bsearch name node.nodes
+
+let get_data name node =
+  match get_datas name node with
+    | [|x|] -> x
+    | _ -> raise (Error "wrong number of data")
+
+let get_node name node =
+  match get_nodes name node with
+    | [|x|] -> x
+    | _ -> raise (Error "wrong number of node")
+
+(* +-----------------------------------------------------------------+
+   | All used tags                                                   |
+   +-----------------------------------------------------------------+ *)
+
+let tag_id = Tag.make "id"
+let tag_width = Tag.make "width"
+let tag_height = Tag.make "height"
+let tag_name = Tag.make "name"
+let tag_genres = Tag.make "genres"
+let tag_years_active = Tag.make "years-active"
+let tag_artist = Tag.make "artist"
+let tag_artists = Tag.make "artists"
+let tag_portrait = Tag.make "portrait"
+
+(* +-----------------------------------------------------------------+
    | Commands                                                        |
    +-----------------------------------------------------------------+ *)
 
@@ -993,109 +1330,47 @@ let split_coma str =
   in
   loop 0 0
 
-module String_map = Map.Make(String)
-
-type data = string
-
-type node = {
-  nodes : node String_map.t;
-  datas : data String_map.t;
-}
-
-let empty = {
-  nodes = String_map.empty;
-  datas = String_map.empty;
-}
-
-let parse_xml root str =
-  let input = Xmlm.make_input ~strip:true (`String (0, str)) in
-  (* Parse the root node. *)
-  let rec parse_root () =
-    match Xmlm.input input with
-      | `El_start ((_, name), _) ->
-          if name <> root then raise (Error "invalid XML root");
-          (* Ignore the name of the root, just parses its children as
-             a list of nodes. *)
-          parse_list String_map.empty String_map.empty
-      | `El_end ->
-          raise (Error "invalid start of XML")
-      | `Data str ->
-          raise (Error "unexpected PCDATA at beginning of XML")
-      | `Dtd _ ->
-          parse_root ()
-
-  (* Parse a sequence of nodes. *)
-  and parse_list nodes datas =
-    match Xmlm.input input with
-      | `El_start ((_, name), _) -> begin
-          match Xmlm.peek input with
-            | `El_start _ ->
-                let node = parse_list String_map.empty String_map.empty in
-                parse_list (String_map.add name node nodes) datas
-            | `El_end ->
-                ignore (Xmlm.input input);
-                parse_list (String_map.add name empty nodes) datas
-            | `Data str -> begin
-                ignore (Xmlm.input input);
-                match Xmlm.input input with
-                  | `El_end ->
-                      parse_list nodes (String_map.add name str datas)
-                  | _ ->
-                      raise (Error "expected end of element after PCDATA in XML")
-              end
-            | `Dtd _ ->
-                raise (Error "unexpected DTD in middle of XML")
-        end
-      | `El_end ->
-          { nodes; datas }
-      | `Data str ->
-          raise (Error "unexpected PCDATA in middle of node list in XML")
-      | `Dtd _ ->
-          raise (Error "unexpected DTD in middle of XML")
-  in
-  try
-    parse_root ()
-  with Xmlm.Error (pos, error) ->
-    raise (Error ("invalid XML: " ^ Xmlm.error_message error))
-
-let get_data name node = String_map.find name node.datas
-let get_node name node = String_map.find name node.nodes
-
 class portrait node = object
-  method id = id_of_string (get_data "id" node)
-  method width = int_of_string (get_data "width" node)
-  method height = int_of_string (get_data "height" node)
+  method id = id_of_string (get_data tag_id node)
+  method width = int_of_string (get_data tag_width node)
+  method height = int_of_string (get_data tag_height node)
 end
 
 class artist node = object
-  method name = get_data "name" node
-  method id = id_of_string (get_data "id" node)
-  method portrait = new portrait (get_node "portrait" node)
-  method genres = split_coma (get_data "genres" node)
-  method years_active = List.map int_of_string (split_coma (get_data "years-active" node))
+  method name = get_data tag_name node
+  method id = id_of_string (get_data tag_id node)
+  method portrait = new portrait (get_node tag_portrait node)
+  method genres = split_coma (get_data tag_genres node)
+  method years_active = List.map int_of_string (split_coma (get_data tag_years_active node))
 end
 
 let get_artist session id =
   if id_length id <> 16 then raise (Wrong_id "artist");
-  lwt channel_id, channel_packet, channel_waiter = alloc_channel session#get in
-  try_lwt
-    let packet = Packet.create () in
-    Packet.add_int16 packet channel_id;
-    (* Kind of the browse query: 1 = arstist. *)
-    Packet.add_int8 packet 1;
-    Packet.add_string packet id;
-    Packet.add_int32 packet 0;
-    lwt () = send_packet session#get CMD_BROWSE (Packet.contents packet) in
-    lwt data = channel_waiter in
-    return (new artist (parse_xml "artist" (inflate data)))
-  finally
-    release_channel session#get channel_id;
-    return ()
+  let cache_file = Filename.concat "artists" (string_of_id id ^ ".xml.gz") in
+  match_lwt Cache.load session cache_file with
+    | Some data ->
+        return (new artist (parse_xml tag_artist (inflate data)))
+    | None ->
+        lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
+        try_lwt
+          let packet = Packet.create () in
+          Packet.add_int16 packet channel_id;
+          (* Kind of the browse query: 1 = arstist. *)
+          Packet.add_int8 packet 1;
+          Packet.add_string packet id;
+          Packet.add_int32 packet 0;
+          lwt () = send_packet session#session_parameters CMD_BROWSE (Packet.contents packet) in
+          lwt data = channel_waiter in
+          lwt () = Cache.save session cache_file data in
+          return (new artist (parse_xml tag_artist (inflate data)))
+        finally
+          release_channel session#session_parameters channel_id;
+          return ()
 
 let search session ?(offset = 0) ?(length = 1000) query =
   let len = String.length query in
   if len > 255 then invalid_arg "Spotify.search";
-  lwt channel_id, channel_packet, channel_waiter = alloc_channel session#get in
+  lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
   try_lwt
     let packet = Packet.create () in
     Packet.add_int16 packet channel_id;
@@ -1104,11 +1379,11 @@ let search session ?(offset = 0) ?(length = 1000) query =
     Packet.add_int16 packet 0;
     Packet.add_int8 packet len;
     Packet.add_string packet query;
-    lwt () = send_packet session#get CMD_SEARCH (Packet.contents packet) in
+    lwt () = send_packet session#session_parameters CMD_SEARCH (Packet.contents packet) in
     lwt data = channel_waiter in
     return (inflate data)
   finally
-    release_channel session#get channel_id;
+    release_channel session#session_parameters channel_id;
     return ()
 
 (*

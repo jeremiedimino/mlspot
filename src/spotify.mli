@@ -139,7 +139,7 @@ class ['a] enum : 'b array -> ('b -> 'a) -> object
         accumulating a result. *)
 end
 
-(** {6 Artists} *)
+(** {6 Types} *)
 
 class type portrait = object
   method id : id
@@ -147,13 +147,84 @@ class type portrait = object
   method height : int
 end
 
+class type bio = object
+  method text : string
+  method portraits : portrait enum
+end
+
+class type restriction = object
+  method catalogues : string list
+  method forbidden : string list
+  method allowed : string list
+end
+
+class type similar_artist = object
+  method name : string
+  method id : id
+  method portrait : id
+  method genres : string list
+  method years_active : int list
+  method restrictions : restriction enum
+end
+
+class type file = object
+  method id : id
+  method format : string
+  method bitrate : int
+end
+
+class type alternative = object
+  method id : id
+  method files : file enum
+  method restrictions : restriction enum
+end
+
+class type track = object
+  method id : id
+  method title : string
+  method explicit : bool
+  method artist : string
+  method artist_id : id
+  method track_number : int
+  method length : float
+  method files : file enum
+  method popularity : float
+  method external_ids : (string * string) enum
+  method alternatives : alternative enum
+end
+
+class type disc = object
+  method disc_number : int
+  method name : string option
+  method tracks : track enum
+end
+
+class type album = object
+  method name : string
+  method id : id
+  method artist : string
+  method artist_id : id
+  method album_type : string
+  method year : int
+  method cover : id
+  method copyrights : string enum
+  method restrictions : restriction enum
+  method external_ids : (string * string) enum
+  method discs : disc enum
+end
+
 class type artist = object
   method name : string
   method id : id
   method portrait : portrait
+  method bios : bio enum
+  method similar_artists : similar_artist enum
   method genres : string list
   method years_active : int list
+  method albums : album enum
 end
+
+(** {6 Commands} *)
 
 val get_artist : session -> id -> artist Lwt.t
   (** [get_artist session id] returns the artist whose ID is

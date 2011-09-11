@@ -11,13 +11,22 @@ open Lwt
 
 let section = Lwt_log.Section.make "spotify"
 
+let rec make_filename l =
+  match l with
+    | [] ->
+        ""
+    | [x] ->
+        x
+    | x :: l ->
+        Filename.concat x (make_filename l)
+
 let xdg_cache_home =
   try
     Sys.getenv "XDG_CACHE_HOME"
   with Not_found ->
     let home = try Sys.getenv "HOME" with Not_found -> (Unix.getpwuid (Unix.getuid ())).Unix.pw_dir in
     if Sys.os_type = "Win32" then
-      Filename.concat (Filename.concat home "Local Settings") "Cache"
+      make_filename [home; "Local Settings"; "Cache"]
     else
       Filename.concat home ".cache"
 
@@ -1127,33 +1136,35 @@ let string_of_id id =
 exception Out_of_bounds
 
 class ['a] enum arr map = object
-  method length = Array.length arr
+  val mapped = Array.map (fun x -> lazy (map x)) arr
+
+  method length = Array.length mapped
 
   method get idx =
     if idx < 0 || idx >= Array.length arr then raise Out_of_bounds;
-    map (Array.unsafe_get arr idx)
+    Lazy.force (Array.unsafe_get mapped idx)
 
   method to_list =
     let rec loop idx acc =
       if idx = -1 then
         acc
       else
-        loop (idx - 1) (map (Array.unsafe_get arr idx) :: acc)
+        loop (idx - 1) (Lazy.force (Array.unsafe_get mapped idx) :: acc)
     in
-    loop (Array.length arr) []
+    loop (Array.length mapped) []
 
   method to_array =
-    Array.map map arr
+    Array.map Lazy.force mapped
 
   method iter (f : 'a -> unit) =
     for idx = 0 to Array.length arr - 1 do
-      f (map (Array.unsafe_get arr idx))
+      f (Lazy.force (Array.unsafe_get mapped idx))
     done
 
   method fold : 'b. ('a -> 'b -> 'b) -> 'b -> 'b = fun f acc ->
     let acc = ref acc in
     for idx = 0 to Array.length arr - 1 do
-      acc := f (map (Array.unsafe_get arr idx)) !acc
+      acc := f (Lazy.force (Array.unsafe_get mapped idx)) !acc
     done;
     !acc
 end
@@ -1172,6 +1183,44 @@ TAGS [
   "artist";
   "artists";
   "portrait";
+  "portraits";
+  "text";
+  "bio";
+  "bios";
+  "similar-artists";
+  "text";
+  "catalogues";
+  "forbidden";
+  "restriction";
+  "restrictions";
+  "artist-id";
+  "track";
+  "tracks";
+  "track-number";
+  "length";
+  "files";
+  "popularity";
+  "external-id";
+  "external-ids";
+  "format";
+  "title";
+  "file";
+  "type";
+  "disc-number";
+  "album-type";
+  "year";
+  "cover";
+  "copyright";
+  "c";
+  "p";
+  "disc";
+  "discs";
+  "similar-artist";
+  "album";
+  "albums";
+  "alternatives";
+  "allowed";
+  "explicit";
 ]
 
 let rec search_tag name a b =
@@ -1209,11 +1258,6 @@ type node = {
   mutable datas : data store Tag_map.t;
   (* Children containing only one CDATA, by tags as well as
      attributes. *)
-}
-
-let empty = {
-  nodes = Tag_map.empty;
-  datas = Tag_map.empty;
 }
 
 let add name elt map =
@@ -1274,7 +1318,7 @@ let make_data dm =
   in
   loop dm.data_size dm.data_data
 
-type state = Undefined | Data of data_maker | Node of node
+type state = Undefined of string store Tag_map.t | Data of data_maker | Node of node
 
 let is_space str =
   let rec loop idx =
@@ -1301,6 +1345,12 @@ let rec print_xml indent node =
        Printf.printf "%s}\n" indent)
     node.nodes
 
+let add_attr key value map =
+  try
+    Tag_map.add (make_tag key) { size = 1; elts = [value] } map
+  with Not_found ->
+    map
+
 let parse_xml root str =
   let xp = Expat.parser_create None in
   let node = { nodes = Tag_map.empty; datas = Tag_map.empty } in
@@ -1309,13 +1359,14 @@ let parse_xml root str =
   Expat.set_start_element_handler xp
     (fun name attrs ->
        match !state with
-         | Undefined ->
-             stack := { nodes = Tag_map.empty; datas = Tag_map.empty } :: !stack
+         | Undefined datas ->
+             stack := { nodes = Tag_map.empty; datas } :: !stack;
+             state := Undefined (List.fold_left (fun map (key, value) -> add_attr key value map) Tag_map.empty attrs)
          | Data str ->
              raise (Error "cannot mix element and cdata")
          | Node node ->
              stack := node :: !stack;
-             state := Undefined);
+             state := Undefined (List.fold_left (fun map (key, value) -> add_attr key value map) Tag_map.empty attrs));
   Expat.set_end_element_handler xp
     (fun name ->
        let node =
@@ -1329,8 +1380,8 @@ let parse_xml root str =
        let old_state = !state in
        state := Node node;
        match old_state with
-         | Undefined ->
-             node.nodes <- add name empty node.nodes
+         | Undefined datas ->
+             node.nodes <- add name { nodes = Tag_map.empty; datas } node.nodes
          | Data dm ->
              node.datas <- add name (make_data dm) node.datas
          | Node node' ->
@@ -1338,7 +1389,7 @@ let parse_xml root str =
   Expat.set_character_data_handler xp
     (fun str ->
        match !state with
-         | Undefined ->
+         | Undefined datas ->
              if not (is_space str) then state := Data { data_size = String.length str; data_data = [str] }
          | Data dm ->
              dm.data_size <- dm.data_size + String.length str;
@@ -1359,16 +1410,15 @@ let parse_xml root str =
    | Documents                                                       |
    +-----------------------------------------------------------------+ *)
 
-let split_coma str =
+let split sep str =
   let rec loop i j =
     if j = String.length str then
       [String.sub str i (j - i)]
     else
-      match str.[j] with
-        | ',' ->
-            String.sub str i (j - i) :: loop (j + 1) (j + 1)
-        | _ ->
-            loop i (j + 1)
+      if str.[j] = sep then
+        String.sub str i (j - i) :: loop (j + 1) (j + 1)
+      else
+        loop i (j + 1)
   in
   loop 0 0
 
@@ -1378,12 +1428,99 @@ XML portrait = {
   "height" = int_of_string DATA;
 }
 
+XML bio = {
+  "text" = DATA;
+  "portraits" = new enum (get_nodes tag_portrait NODE) (fun x -> new portrait x);
+}
+
+XML restriction = {
+  "catalogues" = split ',' DATA;
+  "forbidden" = (try split ' ' DATA with Not_found -> []);
+  "allowed" = (try split ' ' DATA with Not_found -> []);
+}
+
+XML similar_artist = {
+  "name" = DATA;
+  "id" = id_of_string DATA;
+  "portrait" = id_of_string DATA;
+  "genres" = split ',' DATA;
+  "years-active" = List.map int_of_string (split ',' DATA);
+  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction x);
+}
+
+class file node = object
+  val id = lazy(get_data tag_id node)
+  method id = Lazy.force id
+  val format = lazy(
+    match split ',' (get_data tag_format node) with
+      | format :: bitrate :: _ ->
+          (format, int_of_string bitrate)
+      | _ ->
+          raise (Error "invalid file format")
+  )
+  method format = fst (Lazy.force format)
+  method bitrate = snd (Lazy.force format)
+end
+
+XML alternative = {
+  "id" = id_of_string DATA;
+  "files" = new enum (get_nodes tag_file NODE) (fun x -> new file x);
+  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction x);
+}
+
+XML track = {
+  "id" = id_of_string DATA;
+  "title" = DATA;
+  "explicit" = DATA = "true";
+  "artist" = DATA;
+  "artist-id" = id_of_string DATA;
+  "track-number" = int_of_string DATA;
+  "length" = float (int_of_string DATA) /. 1000.;
+  "files" = new enum (get_nodes tag_file NODE) (fun x -> new file x);
+  "popularity" = float_of_string DATA;
+  "external-ids" = new enum (get_nodes tag_external_id NODE) (fun x -> (get_data tag_type x, get_data tag_id x));
+  "alternatives" = new enum (try get_nodes tag_track NODE with Not_found -> [||]) (fun x -> new alternative x)
+}
+
+XML disc = {
+  "disc-number" = int_of_string DATA;
+  "name" = (try Some DATA with Not_found -> None);
+  "tracks" = new enum NODES (fun x -> new track x);
+}
+
+type album_type =
+  | ALBUM_TYPE_ALBUM
+  | ALBUM_TYPE_SINGLE
+  | ALBUM_TYPE_COMPILATION
+  | ALBUM_TYPE_UNKNOWN
+
+XML album = {
+  "name" = DATA;
+  "id" = id_of_string DATA;
+  "artist" = DATA;
+  "artist-id" = id_of_string DATA;
+  "album-type" = DATA;
+  "year" = int_of_string DATA;
+  "cover" = id_of_string DATA;
+  "copyrights" = begin
+    let node = get_node tag_copyright node in
+    let a = Array.append (get_datas tag_c node) (get_datas tag_p node) in
+    new enum a (fun x -> x)
+  end;
+  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction x);
+  "external-ids" = new enum (get_nodes tag_external_id NODE) (fun x -> (get_data tag_type x, get_data tag_id x));
+  "discs" = new enum (get_nodes tag_disc NODE) (fun x -> new disc x);
+}
+
 XML artist = {
   "name" = DATA;
   "id" = id_of_string DATA;
   "portrait" = new portrait NODE;
-  "genres" = split_coma DATA;
-  "years-active" = List.map int_of_string (split_coma DATA);
+  "bios" = new enum (get_nodes tag_bio NODE) (fun x -> new bio x);
+  "similar-artists" = new enum (get_nodes tag_similar_artist NODE) (fun x -> new similar_artist x);
+  "genres" = split ',' DATA;
+  "years-active" = List.map int_of_string (split ',' DATA);
+  "albums" = new enum (get_nodes tag_album NODE) (fun x -> new album x);
 }
 
 (* +-----------------------------------------------------------------+
@@ -1394,7 +1531,7 @@ external inflate : string -> string = "mlspot_inflate"
 
 let get_artist session id =
   if id_length id <> 16 then raise (Wrong_id "artist");
-  let cache_file = Filename.concat "artists" (string_of_id id ^ ".xml.gz") in
+  let cache_file = make_filename ["metadata"; "artists"; string_of_id id ^ ".xml.gz"] in
   match_lwt Cache.load session cache_file with
     | Some data ->
         return (new artist (parse_xml tag_artist (inflate data)))

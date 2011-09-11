@@ -18,7 +18,7 @@ lwt () =
   let session = Spotify.create () in
 
   (* Connect to spotify. *)
-(*  lwt () = Spotify.login session ~username:Sys.argv.(1) ~password:Sys.argv.(2) in*)
+  lwt () = Spotify.login session ~username:Sys.argv.(1) ~password:Sys.argv.(2) in
 
 (*  lwt search = Spotify.search session "tina aren" in*)
 

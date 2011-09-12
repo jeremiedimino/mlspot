@@ -894,6 +894,16 @@ let dh_parameters = {
   Cryptokit.DH.privlen = 160;
 }
 
+let key = "\
+\xae\xd6\xb1\xf6\xf2\x67\x44\xdb\xf1\x79\x85\x30\xc9\xfc\xcc\x35\
+\xb0\x86\x81\x0d\x1d\x87\x2f\x0f\xba\xa8\xbe\x71\x7a\x43\xac\xc6\
+\xd3\x73\x88\x2c\xdf\x3b\x6e\x96\x56\xae\x8b\x18\x93\x56\x77\xb1\
+\xa0\xe0\x4e\xea\xa7\xea\x1d\xbd\xb1\xc5\x95\xb4\x30\xc3\x31\xf1\
+\x57\x4f\x0e\xb8\xc8\x3a\xd6\xb3\x9a\xab\x71\xdc\xbb\x3b\x4d\xb9\
+\x84\x31\x65\x18\x79\x13\x73\xe8\xa6\xe3\xc8\x9b\x56\xcf\x25\x8e\
+\x49\x83\x2d\xe1\x84\xcd\xd4\x5d\x06\xe4\x41\x99\xc7\x0b\x37\x5c\
+\x08\x3e\xdc\x86\x8d\xb0\x21\xbe\xc1\x53\xcb\xf8\xcc\x4f\x40\x13"
+
 let logout session =
   match session#get_session_parameters with
     | None ->
@@ -996,10 +1006,6 @@ let login session ~username ~password =
     (* Generate a secret. *)
     let secret = Cryptokit.DH.private_secret ~rng dh_parameters in
 
-    (* Generate a new RSA key (TODO: use a more secure random number
-       generator, the secure one is too slow). *)
-    let rsa = Cryptokit.RSA.new_key ~rng ~e:65537 1024 in
-
     (* Forge the initial packet. *)
     let packet = Packet.create () in
 
@@ -1026,7 +1032,7 @@ let login session ~username ~password =
     (* DH message. *)
     Packet.add_string packet (Cryptokit.DH.message dh_parameters secret);
     (* RSA modulus. *)
-    Packet.add_string packet rsa.Cryptokit.RSA.n;
+    Packet.add_string packet key;
     (* Length of random data. *)
     Packet.add_int8 packet 0;
     Packet.add_int8 packet (String.length username);

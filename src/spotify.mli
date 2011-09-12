@@ -187,9 +187,9 @@ class type track = object
   method artist : string
   method artist_id : id
   method album : string
-  method album_id : string
+  method album_id : id
   method album_artist : string
-  method album_artist_id : string
+  method album_artist_id : id
   method year : int
   method track_number : int
   method length : float

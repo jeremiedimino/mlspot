@@ -1089,45 +1089,74 @@ let login session ~username ~password =
    | IDs                                                             |
    +-----------------------------------------------------------------+ *)
 
-type id = string
-
 exception Id_parse_failure
 exception Wrong_id of string
 
-let id_length = String.length
+module ID : sig
+  type t
+    (* Note: ID are comparable using (==). *)
 
-let int_of_hexa = function
-  | '0' .. '9' as ch -> Char.code ch - Char.code '0'
-  | 'a' .. 'f' as ch -> Char.code ch - Char.code 'a' + 10
-  | 'A' .. 'F' as ch -> Char.code ch - Char.code 'A' + 10
-  | _ -> raise Id_parse_failure
+  val length : t -> int
 
-let id_of_string str =
-  let len = String.length str in
-  if len land 1 <> 0 then raise Id_parse_failure;
-  let id = String.create (len / 2) in
-  for i = 0 to len / 2 - 1 do
-    let x0 = int_of_hexa (String.unsafe_get str (i * 2 + 0)) in
-    let x1 = int_of_hexa (String.unsafe_get str (i * 2 + 1)) in
-    String.unsafe_set id i (Char.unsafe_chr ((x0 lsl 4) lor x1))
-  done;
-  id
+  val of_string : string -> t
+  val to_string : t -> string
 
-let hexa_of_int n =
-  if n < 10 then
-    Char.unsafe_chr (Char.code '0' + n)
-  else
-    Char.unsafe_chr (Char.code 'a' + n - 10)
+  val add : Packet.t -> t -> unit
+end = struct
 
-let string_of_id id =
-  let len = String.length id in
-  let str = String.create (len * 2) in
-  for i = 0 to len - 1 do
-    let x = Char.code (String.unsafe_get id i) in
-    String.unsafe_set str (i * 2 + 0) (hexa_of_int (x lsr 4));
-    String.unsafe_set str (i * 2 + 1) (hexa_of_int (x land 15))
-  done;
-  str
+  type t = string
+
+  module IDs = Weak.Make (struct
+                            type t = string
+                            let equal = ( = )
+                            let hash = Hashtbl.hash
+                          end)
+
+  (* Weak table of all encountered ids. *)
+  let ids = IDs.create 16384
+
+  let length = String.length
+
+  let int_of_hexa = function
+    | '0' .. '9' as ch -> Char.code ch - Char.code '0'
+    | 'a' .. 'f' as ch -> Char.code ch - Char.code 'a' + 10
+    | 'A' .. 'F' as ch -> Char.code ch - Char.code 'A' + 10
+    | _ -> raise Id_parse_failure
+
+  let of_string str =
+    let len = String.length str in
+    if len land 1 <> 0 then raise Id_parse_failure;
+    let id = String.create (len / 2) in
+    for i = 0 to len / 2 - 1 do
+      let x0 = int_of_hexa (String.unsafe_get str (i * 2 + 0)) in
+      let x1 = int_of_hexa (String.unsafe_get str (i * 2 + 1)) in
+      String.unsafe_set id i (Char.unsafe_chr ((x0 lsl 4) lor x1))
+    done;
+    IDs.merge ids id
+
+  let hexa_of_int n =
+    if n < 10 then
+      Char.unsafe_chr (Char.code '0' + n)
+    else
+      Char.unsafe_chr (Char.code 'a' + n - 10)
+
+  let to_string id =
+    let len = String.length id in
+    let str = String.create (len * 2) in
+    for i = 0 to len - 1 do
+      let x = Char.code (String.unsafe_get id i) in
+      String.unsafe_set str (i * 2 + 0) (hexa_of_int (x lsr 4));
+      String.unsafe_set str (i * 2 + 1) (hexa_of_int (x land 15))
+    done;
+    str
+
+  let add = Packet.add_string
+end
+
+type id = ID.t
+let id_length = ID.length
+let id_of_string = ID.of_string
+let string_of_id = ID.to_string
 
 (* +-----------------------------------------------------------------+
    | Enumerations                                                    |
@@ -1472,7 +1501,7 @@ XML similar_artist = {
 }
 
 class file node = object
-  val id = lazy(get_data tag_id node)
+  val id = lazy(id_of_string (get_data tag_id node))
   method id = Lazy.force id
   val format = lazy(
     match split ',' (get_data tag_format node) with
@@ -1594,7 +1623,7 @@ let browse session ids kind kind_id root xml =
           let packet = Packet.create () in
           Packet.add_int16 packet channel_id;
           Packet.add_int8 packet kind_id;
-          List.iter (Packet.add_string packet) ids;
+          List.iter (ID.add packet) ids;
           if kind_id = 1 || kind_id = 2 then Packet.add_int32 packet 0;
           lwt () = send_packet session#session_parameters CMD_BROWSE (Packet.contents packet) in
           lwt data = channel_waiter in

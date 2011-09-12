@@ -11,6 +11,21 @@ open Lwt
 
 let section = Lwt_log.Section.make "spotify"
 
+type ('a, 'b) either =
+  | Inl of 'a
+  | Inr of 'b
+
+let rec split l =
+  match l with
+    | [] ->
+        ([], [])
+    | Inl x :: l ->
+        let (a, b) = split l in
+        (x :: a, b)
+    | Inr x :: l ->
+        let (a, b) = split l in
+        (a, x :: b)
+
 let rec make_filename l =
   match l with
     | [] ->
@@ -561,13 +576,19 @@ let recv_packet sp =
    +-----------------------------------------------------------------+ *)
 
 module Cache = struct
+  let contains session name =
+    if session#get_use_cache then
+      Sys.file_exists (Filename.concat session#get_cache_dir name)
+    else
+      false
+
   let load session name =
     if session#get_use_cache then
       let filename = Filename.concat session#get_cache_dir name in
       try_lwt
         Lwt_io.with_file ~mode:Lwt_io.input filename Lwt_io.read >|= fun x -> Some x
-      with exn ->
-        ignore (Lwt_log.debug_f ~exn "failed to load %S from the cache" name);
+      with Unix.Unix_error (error, _, _) ->
+        ignore (Lwt_log.debug_f ~section "failed to load %S from the cache: %s" name (Unix.error_message error));
         return None
     else
       return None
@@ -575,21 +596,65 @@ module Cache = struct
   let save session name data =
     if session#get_use_cache then
       let filename = Filename.concat session#get_cache_dir name in
-      try_lwt
-        let rec loop dir =
-          try_lwt
-            Lwt_unix.access dir [Unix.F_OK]
-          with Unix.Unix_error _ ->
-            lwt () = loop (Filename.dirname dir) in
-            Lwt_unix.mkdir dir 0o755
-        in
-        lwt () = loop (Filename.dirname filename) in
-        Lwt_io.with_file ~mode:Lwt_io.output filename (fun oc -> Lwt_io.write oc data)
-      with exn ->
-        ignore (Lwt_log.error_f ~exn "failed to save %S to the cache" name);
+      if Sys.file_exists filename then
         return ()
+      else
+        try_lwt
+          let rec loop dir =
+            try_lwt
+              Lwt_unix.access dir [Unix.F_OK]
+            with Unix.Unix_error _ ->
+              lwt () = loop (Filename.dirname dir) in
+              try_lwt
+                Lwt_unix.mkdir dir 0o755
+              with Unix.Unix_error (Unix.EEXIST, _, _) ->
+                return ()
+          in
+          lwt () = loop (Filename.dirname filename) in
+          Lwt_io.with_file ~mode:Lwt_io.output filename (fun oc -> Lwt_io.write oc data)
+        with Unix.Unix_error (error, _, _) ->
+          ignore (Lwt_log.error_f ~section "failed to save %S to the cache: %s" name (Unix.error_message error));
+          return ()
     else
       return ()
+
+  let get_reader session name =
+    if session#get_use_cache then
+      let filename = Filename.concat session#get_cache_dir name in
+      try_lwt
+        lwt fd = Lwt_unix.openfile filename [Unix.O_RDONLY] 0 in
+        return (Some (filename, fd))
+      with Unix.Unix_error (error, _, _) ->
+        ignore (Lwt_log.debug_f ~section "failed to open %S from the cache for reading: %s" name (Unix.error_message error));
+        return None
+    else
+      return None
+
+  let get_writer session name =
+    if session#get_use_cache then
+      let filename = Filename.concat session#get_cache_dir name in
+      if Sys.file_exists filename then
+        return None
+      else
+        try_lwt
+          let rec loop dir =
+            try_lwt
+              Lwt_unix.access dir [Unix.F_OK]
+            with Unix.Unix_error _ ->
+              lwt () = loop (Filename.dirname dir) in
+              try_lwt
+                Lwt_unix.mkdir dir 0o755
+              with Unix.Unix_error (Unix.EEXIST, _, _) ->
+                return ()
+          in
+          lwt () = loop (Filename.dirname filename) in
+          lwt fd = Lwt_unix.openfile filename [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o644 in
+          return (Some (filename, fd))
+        with Unix.Unix_error (error, _, _) ->
+          ignore (Lwt_log.error_f "failed to open %S from the cache for writing: %s" name (Unix.error_message error));
+          return None
+    else
+      return None
 end
 
 (* +-----------------------------------------------------------------+
@@ -677,7 +742,7 @@ let dispatch sp command payload =
         return ()
 
     | _ ->
-        Lwt_log.warning_f ~section "do not know what to do with command '%s'" (string_of_command command)
+        Lwt_log.info_f ~section "do not know what to do with command '%s'" (string_of_command command)
 
 let disconnect sp =
   if not sp.disconnected then begin
@@ -1097,6 +1162,7 @@ module ID : sig
     (* Note: ID are comparable using (==). *)
 
   val length : t -> int
+  val hash : t -> int
 
   val of_string : string -> t
   val to_string : t -> string
@@ -1104,18 +1170,24 @@ module ID : sig
   val add : Packet.t -> t -> unit
 end = struct
 
-  type t = string
+  type t = {
+    bytes : string;
+    hash : int;
+  }
+
+  type id = t
 
   module IDs = Weak.Make (struct
-                            type t = string
-                            let equal = ( = )
-                            let hash = Hashtbl.hash
+                            type t = id
+                            let equal id1 id2 = id1.bytes = id2.bytes
+                            let hash id = id.hash
                           end)
 
   (* Weak table of all encountered ids. *)
   let ids = IDs.create 16384
 
-  let length = String.length
+  let length id = String.length id.bytes
+  let hash id = id.hash
 
   let int_of_hexa = function
     | '0' .. '9' as ch -> Char.code ch - Char.code '0'
@@ -1126,13 +1198,13 @@ end = struct
   let of_string str =
     let len = String.length str in
     if len land 1 <> 0 then raise Id_parse_failure;
-    let id = String.create (len / 2) in
+    let bytes = String.create (len / 2) in
     for i = 0 to len / 2 - 1 do
       let x0 = int_of_hexa (String.unsafe_get str (i * 2 + 0)) in
       let x1 = int_of_hexa (String.unsafe_get str (i * 2 + 1)) in
-      String.unsafe_set id i (Char.unsafe_chr ((x0 lsl 4) lor x1))
+      String.unsafe_set bytes i (Char.unsafe_chr ((x0 lsl 4) lor x1))
     done;
-    IDs.merge ids id
+    IDs.merge ids { bytes; hash = Hashtbl.hash bytes }
 
   let hexa_of_int n =
     if n < 10 then
@@ -1141,62 +1213,24 @@ end = struct
       Char.unsafe_chr (Char.code 'a' + n - 10)
 
   let to_string id =
-    let len = String.length id in
+    let len = String.length id.bytes in
     let str = String.create (len * 2) in
     for i = 0 to len - 1 do
-      let x = Char.code (String.unsafe_get id i) in
+      let x = Char.code (String.unsafe_get id.bytes i) in
       String.unsafe_set str (i * 2 + 0) (hexa_of_int (x lsr 4));
       String.unsafe_set str (i * 2 + 1) (hexa_of_int (x land 15))
     done;
     str
 
-  let add = Packet.add_string
+  let add packet id =
+    Packet.add_string packet id.bytes
 end
 
 type id = ID.t
 let id_length = ID.length
+let id_hash = ID.hash
 let id_of_string = ID.of_string
 let string_of_id = ID.to_string
-
-(* +-----------------------------------------------------------------+
-   | Enumerations                                                    |
-   +-----------------------------------------------------------------+ *)
-
-exception Out_of_bounds
-
-class ['a] enum arr map = object
-  val mapped = Array.map (fun x -> lazy (map x)) arr
-
-  method length = Array.length mapped
-
-  method get idx =
-    if idx < 0 || idx >= Array.length arr then raise Out_of_bounds;
-    Lazy.force (Array.unsafe_get mapped idx)
-
-  method to_list =
-    let rec loop idx acc =
-      if idx = -1 then
-        acc
-      else
-        loop (idx - 1) (Lazy.force (Array.unsafe_get mapped idx) :: acc)
-    in
-    loop (Array.length mapped) []
-
-  method to_array =
-    Array.map Lazy.force mapped
-
-  method iter (f : 'a -> unit) =
-    for idx = 0 to Array.length arr - 1 do
-      f (Lazy.force (Array.unsafe_get mapped idx))
-    done
-
-  method fold : 'b. ('a -> 'b -> 'b) -> 'b -> 'b = fun f acc ->
-    let acc = ref acc in
-    for idx = 0 to Array.length arr - 1 do
-      acc := f (Lazy.force (Array.unsafe_get mapped idx)) !acc
-    done;
-    !acc
-end
 
 (* +-----------------------------------------------------------------+
    | XML                                                             |
@@ -1286,164 +1320,668 @@ module Tag_map = Map.Make (struct
 type data = string
     (* Type of attributes and CDATA. *)
 
-type 'a store = {
-  mutable size : int;
-  mutable elts : 'a list;
+type node = {
+  mutable nodes : node list Tag_map.t;
+  (* Children, by tags. Children for a given tag are in reverse
+     order. *)
+  mutable datas : data list Tag_map.t;
+  (* Children containing only one CDATA, by tags as well as
+     attributes. Datas for a given tag are in reverse order. *)
 }
 
-type node = {
-  mutable nodes : node store Tag_map.t;
-  (* Children, by tags. *)
-  mutable datas : data store Tag_map.t;
-  (* Children containing only one CDATA, by tags as well as
-     attributes. *)
+let empty = {
+  nodes = Tag_map.empty;
+  datas = Tag_map.empty;
 }
 
 let add name elt map =
   try
     let tag = make_tag name in
     try
-      let store = Tag_map.find tag map in
-      store.size <- store.size + 1;
-      store.elts <- elt :: store.elts;
-      map
+      Tag_map.add tag (elt :: Tag_map.find tag map) map
     with Not_found ->
-      Tag_map.add tag { size = 1; elts = [elt] } map
+      Tag_map.add tag [elt] map
   with Not_found ->
     map
 
-let rec rev_fill arr idx elts =
-  match elts with
-    | [] ->
-        ()
-    | x :: elts ->
-        arr.(idx) <- x;
-        rev_fill arr (idx - 1) elts
-
-let array_of_store store =
-  let arr = Array.make store.size (List.hd store.elts) in
-  rev_fill arr (store.size - 1) store.elts;
-  arr
-
-let get_datas tag node = array_of_store (Tag_map.find tag node.datas)
-let get_nodes tag node = array_of_store (Tag_map.find tag node.nodes)
+let get_datas tag node = try List.rev (Tag_map.find tag node.datas) with Not_found -> []
+let get_nodes tag node = try List.rev (Tag_map.find tag node.nodes) with Not_found -> []
 
 let get_data tag node =
-  match (Tag_map.find tag node.datas).elts with
+  match Tag_map.find tag node.datas with
     | [x] -> x
-    | _ -> raise (Error "wrong number of data")
+    | _ -> raise (Error (Printf.sprintf "too many datas to unpack for tag '%s'" tags.(tag)))
 
 let get_node tag node =
-  match (Tag_map.find tag node.nodes).elts with
+  match Tag_map.find tag node.nodes with
     | [x] -> x
-    | _ -> raise (Error "wrong number of node")
+    | _ -> raise (Error (Printf.sprintf "too many nodes to unpack for tag '%s'" tags.(tag)))
 
-type data_maker = {
-  mutable data_size : int;
-  mutable data_data : string list;
-}
+module XML = struct
 
-let make_data dm =
-  let res = String.create dm.data_size in
-  let rec loop ofs l =
-    match l with
-      | [] ->
-          res
-      | str :: l ->
-          let len = String.length str in
-          let ofs = ofs - len in
-          String.unsafe_blit str 0 res ofs len;
-          loop ofs l
-  in
-  loop dm.data_size dm.data_data
+  type data_maker = {
+    mutable data_size : int;
+    mutable data_data : string list;
+  }
 
-type state = Undefined of string store Tag_map.t | Data of data_maker | Node of node
+  let make_data dm =
+    let res = String.create dm.data_size in
+    let rec loop ofs l =
+      match l with
+        | [] ->
+            res
+        | str :: l ->
+            let len = String.length str in
+            let ofs = ofs - len in
+            String.unsafe_blit str 0 res ofs len;
+            loop ofs l
+    in
+    loop dm.data_size dm.data_data
 
-let is_space str =
-  let rec loop idx =
-    if idx = String.length str then
-      true
-    else
-      match String.unsafe_get str idx with
-        | ' ' | '\t' | '\n' ->
-            loop (idx + 1)
-        | _ ->
-            false
-  in
-  loop 0
+  type state = Undefined of string list Tag_map.t | Data of data_maker | Node of node
 
-let rec print_xml indent node =
-  Tag_map.iter
-    (fun tag store ->
-       Printf.printf "%s%s = [%s]\n" indent tags.(tag) (String.concat "; " (List.rev_map (Printf.sprintf "%S") store.elts)))
-    node.datas;
-  Tag_map.iter
-    (fun tag store ->
-       Printf.printf "%s%s = {\n" indent tags.(tag);
-       List.iter (print_xml ("  " ^ indent)) (List.rev store.elts);
-       Printf.printf "%s}\n" indent)
-    node.nodes
+  let is_space str =
+    let rec loop idx =
+      if idx = String.length str then
+        true
+      else
+        match String.unsafe_get str idx with
+          | ' ' | '\t' | '\n' ->
+              loop (idx + 1)
+          | _ ->
+              false
+    in
+    loop 0
 
-let add_attr key value map =
-  try
-    Tag_map.add (make_tag key) { size = 1; elts = [value] } map
-  with Not_found ->
-    map
+  let rec print indent node =
+    Tag_map.iter
+      (fun tag elts ->
+         Printf.printf "%s%s = [%s]\n" indent tags.(tag) (String.concat "; " (List.rev_map (Printf.sprintf "%S") elts)))
+      node.datas;
+    Tag_map.iter
+      (fun tag elts ->
+         List.iter
+           (fun elt ->
+              Printf.printf "%s%s = {\n" indent tags.(tag);
+              print ("  " ^ indent) elt;
+              Printf.printf "%s}\n" indent)
+           (List.rev elts))
+      node.nodes
 
-let parse_xml root str =
-  let xp = Expat.parser_create None in
-  let node = { nodes = Tag_map.empty; datas = Tag_map.empty } in
-  let stack = ref [] in
-  let state = ref (Node node) in
-  Expat.set_start_element_handler xp
-    (fun name attrs ->
-       match !state with
-         | Undefined datas ->
-             stack := { nodes = Tag_map.empty; datas } :: !stack;
-             state := Undefined (List.fold_left (fun map (key, value) -> add_attr key value map) Tag_map.empty attrs)
-         | Data str ->
-             raise (Error "cannot mix element and cdata")
-         | Node node ->
-             stack := node :: !stack;
-             state := Undefined (List.fold_left (fun map (key, value) -> add_attr key value map) Tag_map.empty attrs));
-  Expat.set_end_element_handler xp
-    (fun name ->
-       let node =
-         match !stack with
-           | [] ->
-               assert false
-           | node :: rest ->
-               stack := rest;
-               node
-       in
-       let old_state = !state in
-       state := Node node;
-       match old_state with
-         | Undefined datas ->
-             node.nodes <- add name { nodes = Tag_map.empty; datas } node.nodes
-         | Data dm ->
-             node.datas <- add name (make_data dm) node.datas
-         | Node node' ->
-             node.nodes <- add name node' node.nodes);
-  Expat.set_character_data_handler xp
-    (fun str ->
-       match !state with
-         | Undefined datas ->
-             if not (is_space str) then state := Data { data_size = String.length str; data_data = [str] }
-         | Data dm ->
-             dm.data_size <- dm.data_size + String.length str;
-             dm.data_data <- str :: dm.data_data
-         | Node _ ->
-             if not (is_space str) then raise (Error "cannot mix elements and cdata"));
-  try
-    Expat.parse xp str;
-    Expat.final xp;
+  let create_parser () =
+    let xp = Expat.parser_create None in
+    let node = { nodes = Tag_map.empty; datas = Tag_map.empty } in
+    let stack = ref [] in
+    let state = ref (Node node) in
+    Expat.set_start_element_handler xp
+      (fun name attrs ->
+         match !state with
+           | Undefined datas ->
+               stack := { nodes = Tag_map.empty; datas } :: !stack;
+               state := Undefined (List.fold_left (fun map (key, value) -> add key value map) Tag_map.empty attrs)
+           | Data str ->
+               raise (Error "cannot mix element and cdata")
+           | Node node ->
+               stack := node :: !stack;
+               state := Undefined (List.fold_left (fun map (key, value) -> add key value map) Tag_map.empty attrs));
+    Expat.set_end_element_handler xp
+      (fun name ->
+         let node =
+           match !stack with
+             | [] ->
+                 assert false
+             | node :: rest ->
+                 stack := rest;
+                 node
+         in
+         let old_state = !state in
+         state := Node node;
+         match old_state with
+           | Undefined datas ->
+               node.nodes <- add name { nodes = Tag_map.empty; datas } node.nodes
+           | Data dm ->
+               node.datas <- add name (make_data dm) node.datas
+           | Node node' ->
+               node.nodes <- add name node' node.nodes);
+    Expat.set_character_data_handler xp
+      (fun str ->
+         match !state with
+           | Undefined datas ->
+               if not (is_space str) then state := Data { data_size = String.length str; data_data = [str] }
+           | Data dm ->
+               dm.data_size <- dm.data_size + String.length str;
+               dm.data_data <- str :: dm.data_data
+           | Node _ ->
+               if not (is_space str) then raise (Error "cannot mix elements and cdata"));
+    (xp, node)
+
+  let buffer_size = 8192
+
+  module type Monad = sig
+    type 'a t
+    val bind : 'a t -> ('a -> 'b t) -> 'b t
+    val return : 'a -> 'a t
+  end
+
+  module Make_gzip_header_reader (Lwt : Monad) = struct
+    open Lwt
+
+    let rec skip_string read_byte =
+      match_lwt read_byte () with
+        | 0 -> return ()
+        | _ -> skip_string read_byte
+
+    let read read_byte =
+      lwt id1 = read_byte () in
+      lwt id2 = read_byte () in
+      if id1 <> 0x1f || id2 <> 0x8b then raise (Error "invalid gzip file: bad magic number");
+      lwt cm = read_byte () in
+      if cm <> 8 then raise (Error "invalid gzip file: unknown compression method");
+      lwt flags = read_byte () in
+      if flags land 0xe0 <> 0 then raise (Error "invalid gzip file: bad flags");
+      lwt () = for_lwt i = 1 to 6 do read_byte () >> return () done in
+      lwt () =
+        if flags land 0x04 <> 0 then begin
+          lwt len1 = read_byte () in
+          lwt len2 = read_byte () in
+          for_lwt i = 1 to len1 lor (len2 lsl 8) do
+            lwt _ = read_byte () in
+            return ()
+          done
+        end else
+          return ()
+      in
+      lwt () =
+        if flags land 0x08 <> 0 then
+          skip_string read_byte
+        else
+          return ()
+      in
+      lwt () =
+        if flags land 0x10 <> 0 then
+          skip_string read_byte
+        else
+          return ()
+      in
+      if flags land 0x02 <> 0 then
+        lwt _ = read_byte () in
+        lwt _ = read_byte () in
+        return ()
+      else
+        return ()
+  end
+
+  module Gzip = Make_gzip_header_reader (struct
+                                           type 'a t = 'a
+                                           let bind x f = f x
+                                           let return x = x
+                                           let fail = raise
+                                         end)
+
+  module Lwt_gzip = Make_gzip_header_reader (Lwt)
+
+  let get_int32_little_endian str ofs =
+    if ofs < 0 || ofs + 4 > String.length str then raise (Error "invalid gzip file: premature end of file");
+    let x0 = Int32.of_int (Char.code (String.unsafe_get str (ofs + 0))) in
+    let x1 = Int32.of_int (Char.code (String.unsafe_get str (ofs + 1))) in
+    let x2 = Int32.of_int (Char.code (String.unsafe_get str (ofs + 2))) in
+    let x3 = Int32.of_int (Char.code (String.unsafe_get str (ofs + 3))) in
+    Int32.logor x0 (Int32.logor (Int32.shift_left x1 8) (Int32.logor (Int32.shift_left x2 16) (Int32.shift_left x3 24)))
+
+  let parse_string str =
+    let xp, node = create_parser () in
     try
-      get_node root node
+      Expat.parse xp str;
+      Expat.final xp;
+      node
+    with Expat.Expat_error error ->
+      raise (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
+
+  let parse_compressed_string str =
+    let xp, node = create_parser () in
+    let buffer = String.create buffer_size in
+    let stream = Zlib.inflate_init false in
+    try
+      let rec loop ofs size crc =
+        let eoi, len_src, len_dst = Zlib.inflate stream str ofs (String.length str - ofs) buffer 0 buffer_size Zlib.Z_NO_FLUSH in
+        let size = Int32.add size (Int32.of_int len_dst) in
+        let crc = Zlib.update_crc crc buffer 0 len_dst in
+        Expat.parse_sub xp buffer 0 len_dst;
+        if not eoi then
+          loop (ofs + len_src) size crc
+        else
+          (ofs + len_src, size, crc)
+      in
+      let ofs = ref 0 in
+      let read_byte () =
+        if !ofs >= String.length str then
+          raise (Error "invalid gzip file: prematire end of file")
+        else begin
+          let o = !ofs in
+          ofs := o + 1;
+          Char.code (String.unsafe_get str o)
+        end
+      in
+      Gzip.read read_byte;
+      let ofs, size, crc = loop !ofs Int32.zero Int32.zero in
+      Zlib.inflate_end stream;
+      let crc' = get_int32_little_endian str ofs in
+      let size' = get_int32_little_endian str (ofs + 4) in
+      if crc <> crc' then raise (Error "invalid gzip file: CRC mismatch");
+      if size <> size' then raise (Error "invalid gzip file: size mismatch");
+      Expat.final xp;
+      node
+    with
+      | Expat.Expat_error error ->
+          raise (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
+      | Zlib.Error (func, msg) ->
+          raise (Error ("invalid compressed data: " ^ msg))
+
+  let parse_file_descr fd =
+    let xp, node = create_parser () in
+    let buffer = String.create buffer_size in
+    try_lwt
+      let rec loop () =
+        match_lwt Lwt_unix.read fd buffer 0 buffer_size with
+          | 0 ->
+              return ()
+          | n ->
+              Expat.parse_sub xp buffer 0 n;
+              loop ()
+      in
+      lwt () = loop () in
+      Expat.final xp;
+      return node
+    with
+      | Expat.Expat_error error ->
+          raise_lwt (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
+      | Unix.Unix_error (error, _, _) ->
+          raise_lwt (Error ("cannot read file: " ^ Unix.error_message error))
+    finally
+      Lwt_unix.close fd
+
+  let parse_compressed_file_descr fd =
+    let xp, node = create_parser () in
+    let ibuffer = String.create buffer_size in
+    let obuffer = String.create buffer_size in
+    let stream = Zlib.inflate_init false in
+    try_lwt
+      let rec loop ofs size crc =
+        match_lwt Lwt_unix.read fd ibuffer ofs (buffer_size - ofs) with
+          | 0 ->
+              let rec loop ofs' size crc =
+                let eoi, len_src, len_dst = Zlib.inflate stream ibuffer ofs' (ofs - ofs') obuffer 0 buffer_size Zlib.Z_NO_FLUSH in
+                let size = Int32.add size (Int32.of_int len_dst) in
+                let crc = Zlib.update_crc crc obuffer 0 len_dst in
+                Expat.parse_sub xp obuffer 0 len_dst;
+                if not eoi then
+                  loop (ofs' + len_src) size crc
+                else begin
+                  let rem = ofs - (ofs' + len_src) in
+                  if rem <> 0 then String.blit ibuffer (ofs' + len_src) ibuffer 0 rem;
+                  return (rem, size, crc)
+                end
+              in
+              loop 0 size crc
+          | n ->
+              let eoi, len_src, len_dst = Zlib.inflate stream ibuffer 0 (ofs + n) obuffer 0 buffer_size Zlib.Z_NO_FLUSH in
+              let size = Int32.add size (Int32.of_int len_dst) in
+              let crc = Zlib.update_crc crc obuffer 0 len_dst in
+              Expat.parse_sub xp obuffer 0 len_dst;
+              if len_src < n then begin
+                String.blit ibuffer len_src ibuffer 0 (n - len_src);
+                loop (n - len_src) size crc
+              end else
+                loop 0 size crc
+      in
+      let ofs = ref 0 and len = ref 0 in
+      let read_byte () =
+        if !ofs = !len then
+          match_lwt Lwt_unix.read fd ibuffer 0 buffer_size with
+            | 0 ->
+                raise_lwt (Error "invalid gzip file: premature end of file")
+            | n ->
+                ofs := 1;
+                len := n;
+                return (Char.code (String.unsafe_get ibuffer 0))
+        else begin
+          let o = !ofs in
+          ofs := o + 1;
+          return (Char.code (String.unsafe_get ibuffer o))
+        end
+      in
+      lwt () = Lwt_gzip.read read_byte in
+      if !ofs < !len then String.blit ibuffer !ofs ibuffer 0 (!len - !ofs);
+      lwt ofs, size, crc = loop (!len - !ofs) Int32.zero Int32.zero in
+      Zlib.inflate_end stream;
+      let rec refill8 ofs =
+        if ofs < 8 then
+          match_lwt Lwt_unix.read fd ibuffer ofs (8 - ofs) with
+            | 0 -> raise_lwt (Error "invalid gzip file: premature end of file")
+            | n -> refill8 (ofs + n)
+        else
+          return ()
+      in
+      lwt () = refill8 ofs in
+      let crc' = get_int32_little_endian ibuffer 0 in
+      let size' = get_int32_little_endian ibuffer 4 in
+      if crc <> crc' then raise (Error "invalid gzip file: CRC mismatch");
+      if size <> size' then raise (Error "invalid gzip file: size mismatch");
+      Expat.final xp;
+      return node
+    with
+      | Expat.Expat_error error ->
+          raise_lwt (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
+      | Unix.Unix_error (error, _, _) ->
+          raise_lwt (Error ("cannot read file: " ^ Unix.error_message error))
+    finally
+      Lwt_unix.close fd
+
+  type writer = {
+    fd : Lwt_unix.file_descr;
+    (* The file descriptor used for the output. *)
+    file : string;
+    (* The file we are writing to. In case of error it is erased. *)
+    stream : Zlib.stream;
+    (* The Zlib stream. *)
+    mutable indent : int;
+    (* Current indentiation. *)
+    mutable iofs : int;
+    (* Offset of end of data in the uncompressed buffer. *)
+    mutable oofs : int;
+    (* Offset of end of data in the compressed buffer. *)
+    ibuffer : string;
+    (* The uncompressed buffer. *)
+    obuffer : string;
+    (* The compressed buffer. *)
+    mutable size : int32;
+    (* Size of data written so far. *)
+    mutable crc : int32;
+    (* CRC of data written so far. *)
+  }
+
+  let create_writer fd file =
+    let oc = {
+      fd = fd;
+      file = file;
+      stream = Zlib.deflate_init 9 false;
+      indent = 0;
+      iofs = 0;
+      oofs = 10;
+      ibuffer = String.create buffer_size;
+      obuffer = String.create (buffer_size + 8);
+      size = Int32.zero;
+      crc = Int32.zero;
+    } in
+    (* Write header. *)
+    put_int8 oc.obuffer 0 0x1f;
+    put_int8 oc.obuffer 1 0x8b;
+    put_int8 oc.obuffer 2 8;
+    put_int8 oc.obuffer 3 0;
+    put_int32 oc.obuffer 4 0;
+    put_int8 oc.obuffer 8 0;
+    put_int8 oc.obuffer 9 0xff;
+    oc
+
+  let rec write oc str ofs len =
+    let avail = buffer_size - oc.iofs in
+    if len <= avail then begin
+      String.blit str ofs oc.ibuffer oc.iofs len;
+      oc.iofs <- oc.iofs + len;
+      return ()
+    end else begin
+      String.blit str ofs oc.ibuffer oc.iofs avail;
+      (* Compress the input buffer. *)
+      let _, len_src, len_dst = Zlib.deflate oc.stream oc.ibuffer 0 buffer_size oc.obuffer oc.oofs (buffer_size - oc.oofs) Zlib.Z_NO_FLUSH in
+      (* Update size and CRC. *)
+      oc.size <- Int32.add oc.size (Int32.of_int len_src);
+      oc.crc <- Zlib.update_crc oc.crc oc.ibuffer 0 len_src;
+      (* Write as much as possible. *)
+      lwt n = Lwt_unix.write oc.fd oc.obuffer 0 (oc.oofs + len_dst) in
+      (* Update buffers and offsets. *)
+      let iremaining = buffer_size - len_src in
+      let oremaining = oc.oofs + len_dst - n in
+      if iremaining <> 0 then String.blit oc.ibuffer len_src oc.ibuffer 0 iremaining;
+      if oremaining <> 0 then String.blit oc.obuffer n oc.obuffer 0 oremaining;
+      oc.iofs <- iremaining;
+      oc.oofs <- oremaining;
+      (* Write remaining data. *)
+      write oc str (ofs + avail) (len - avail)
+    end
+
+  let write_string oc str = write oc str 0 (String.length str)
+
+  let rec write_exactly fd str ofs len =
+    if len = 0 then
+      return ()
+    else
+      lwt n = Lwt_unix.write fd str ofs len in
+      write_exactly fd str (ofs + n) (len - n)
+
+  let rec finish_deflate oc iofs =
+    let finished, len_src, len_dst = Zlib.deflate oc.stream oc.ibuffer iofs (oc.iofs - iofs) oc.obuffer oc.oofs (buffer_size - oc.oofs) Zlib.Z_FINISH in
+    (* Update size and CRC. *)
+    oc.size <- Int32.add oc.size (Int32.of_int len_src);
+    oc.crc <- Zlib.update_crc oc.crc oc.ibuffer iofs len_src;
+    if not finished then begin
+      (* Flush the output buffer. *)
+      lwt n = Lwt_unix.write oc.fd oc.obuffer 0 (oc.oofs + len_dst) in
+      (* Update the buffer and the offset. *)
+      let oremaining = oc.oofs + len_dst - n in
+      if oremaining <> 0 then String.blit oc.obuffer n oc.obuffer 0 oremaining;
+      oc.oofs <- oremaining;
+      finish_deflate oc (iofs + len_src)
+    end else begin
+      oc.oofs <- oc.oofs + len_dst;
+      return ()
+    end
+
+  let put_int32_little_endian str ofs x =
+    String.unsafe_set str (ofs + 0) (Char.unsafe_chr (Int32.to_int x));
+    String.unsafe_set str (ofs + 1) (Char.unsafe_chr (Int32.to_int (Int32.shift_right_logical x 8)));
+    String.unsafe_set str (ofs + 2) (Char.unsafe_chr (Int32.to_int (Int32.shift_right_logical x 16)));
+    String.unsafe_set str (ofs + 3) (Char.unsafe_chr (Int32.to_int (Int32.shift_right_logical x 24)))
+
+  let close oc =
+    lwt () = finish_deflate oc 0 in
+    (* Dispose of the stream. *)
+    Zlib.deflate_end oc.stream;
+    (* Write CRC and size. *)
+    put_int32_little_endian oc.obuffer oc.oofs oc.crc;
+    put_int32_little_endian oc.obuffer (oc.oofs + 4) oc.size;
+    (* Flush the buffer. *)
+    lwt () = write_exactly oc.fd oc.obuffer 0 (oc.oofs + 8) in
+    (* Close the file. *)
+    Lwt_unix.close oc.fd
+
+  let abort oc =
+    lwt () = try_lwt Lwt_unix.close oc.fd with _ -> return () in
+    try_lwt
+      Lwt_unix.unlink oc.file
+    with Unix.Unix_error (error, _, _) ->
+      ignore (Lwt_log.error_f ~section "cannot unlink %S: %s" oc.file (Unix.error_message error));
+      return ()
+
+  let rec write_indent oc n =
+    if n < oc.indent then
+      lwt () = write_string oc "  " in
+      write_indent oc (n + 1)
+    else
+      return ()
+
+  let rec write_cdata oc data i j =
+    if j = String.length data then
+      if i < j then
+        write oc data i (j - i)
+      else
+        return ()
+    else
+      match data.[j] with
+        | '"' ->
+            if i < j then
+              lwt () = write oc data i (j - i) in
+              lwt () = write_string oc "&quot;" in
+              write_cdata oc data (j + 1) (j + 1)
+            else
+              lwt () = write_string oc "&quot;" in
+              write_cdata oc data (j + 1) (j + 1)
+        | '<' ->
+            if i < j then
+              lwt () = write oc data i (j - i) in
+              lwt () = write_string oc "&lt;" in
+              write_cdata oc data (j + 1) (j + 1)
+            else
+              lwt () = write_string oc "&lt;" in
+              write_cdata oc data (j + 1) (j + 1)
+        | '>' ->
+            if i < j then
+              lwt () = write oc data i (j - i) in
+              lwt () = write_string oc "&gt;" in
+              write_cdata oc data (j + 1) (j + 1)
+            else
+              lwt () = write_string oc "&gt;" in
+              write_cdata oc data (j + 1) (j + 1)
+        | '&' ->
+            if i < j then
+              lwt () = write oc data i (j - i) in
+              lwt () = write_string oc "&amp;" in
+              write_cdata oc data (j + 1) (j + 1)
+            else
+              lwt () = write_string oc "&amp;" in
+              write_cdata oc data (j + 1) (j + 1)
+        | _ ->
+            write_cdata oc data i (j + 1)
+
+  let write_data oc tag data =
+    lwt () = write_indent oc 0 in
+    lwt () = write_string oc "<" in
+    lwt () = write_string oc tags.(tag) in
+    lwt () = write_string oc ">" in
+    lwt () = write_cdata oc data 0 0 in
+    lwt () = write_string oc "</" in
+    lwt () = write_string oc tags.(tag) in
+    lwt () = write_string oc ">\n" in
+    return ()
+
+  let write_node oc tag f =
+    lwt () = write_indent oc 0 in
+    lwt () = write_string oc "<" in
+    lwt () = write_string oc tags.(tag) in
+    lwt () = write_string oc ">\n" in
+    oc.indent <- oc.indent + 1;
+    lwt () = f oc in
+    oc.indent <- oc.indent - 1;
+    lwt () = write_indent oc 0 in
+    lwt () = write_string oc "</" in
+    lwt () = write_string oc tags.(tag) in
+    lwt () = write_string oc ">\n" in
+    return ()
+
+  let write_nodes oc tag writer l =
+    write_node oc tag (fun oc -> Lwt_list.iter_s (fun x -> writer oc x) l)
+end
+
+(* +-----------------------------------------------------------------+
+   | Cache                                                           |
+   +-----------------------------------------------------------------+ *)
+
+module Weak_cache : sig
+  type 'a t constraint 'a = < id : id; .. >
+    (* Type of object catching element of type ['a], indexed by an
+       ID. Element must be finalisable. *)
+
+  val create : int -> 'a t
+    (* Create a new empty cache. *)
+
+  val find : 'a t -> id -> (unit -> 'a) -> 'a
+    (* [find cache id make] search for an element with id [id] in
+       [cache]. If one is found it is returned, otherwise a new one is
+       created with [make], added to the cache and returned.
+
+       Note that the cache keeps only a weak reference to the element,
+       so its is removed when collected. *)
+
+  val find_lwt : 'a t -> id -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+    (* Same as find but [make] returns a thread. *)
+
+  val find_multiple_lwt : 'a t -> id list -> (id list -> 'a list Lwt.t) -> 'a list Lwt.t
+    (* [find_multiple_lwt cache ids make] returns all elements found
+       in the cache, creating missing ones with [make]. *)
+end = struct
+  module Table = Hashtbl.Make (struct
+                                 type t = id
+                                 let equal = ( == )
+                                 let hash = id_hash
+                               end)
+
+  type 'a t = 'a Weak.t Table.t constraint 'a = < id : id; .. >
+
+  let create size = Table.create size
+
+  let finalise cache obj =
+    Table.remove cache obj#id
+
+  let find cache id make =
+    try
+      let weak = Table.find cache id in
+      match Weak.get weak 0 with
+        | Some data ->
+            data
+        | None ->
+            let data = make () in
+            Weak.set weak 0 (Some data);
+            data
     with Not_found ->
-      raise (Error "invalid XML")
-  with Expat.Expat_error error ->
-    raise (Error (Expat.xml_error_to_string error))
+      let data = make () in
+      let weak = Weak.create 1 in
+      Weak.set weak 0 (Some data);
+      Table.add cache id weak;
+      Gc.finalise (finalise cache) data;
+      data
+
+  let find_lwt cache id make =
+    try
+      let weak = Table.find cache id in
+      match Weak.get weak 0 with
+        | Some data ->
+            return data
+        | None ->
+            lwt data = make () in
+            Weak.set weak 0 (Some data);
+            return data
+    with Not_found ->
+      lwt data = make () in
+      let weak = Weak.create 1 in
+      Weak.set weak 0 (Some data);
+      Table.add cache id weak;
+      Gc.finalise (finalise cache) data;
+      return data
+
+  let find_multiple_lwt cache ids make =
+    let old_datas, ids =
+      split
+        (List.map
+           (fun id ->
+              try
+                match Weak.get (Table.find cache id) 0 with
+                  | Some data ->
+                      Inl data
+                  | None ->
+                      Inr id
+              with Not_found ->
+                Inr id)
+           ids)
+    in
+    lwt new_datas = make ids in
+    List.iter
+      (fun data ->
+         let weak = Weak.create 1 in
+         Weak.set weak 0 (Some data);
+         Table.add cache data#id weak;
+         Gc.finalise (finalise cache) data)
+      new_datas;
+    return (old_datas @ new_datas)
+end
 
 (* +-----------------------------------------------------------------+
    | Documents                                                       |
@@ -1474,177 +2012,635 @@ let split_space_coma str =
   in
   loop 0 0
 
-XML portrait = {
-  "id" = id_of_string DATA;
-  "width" = int_of_string DATA;
-  "height" = int_of_string DATA;
-}
+class portrait node (id : id) = object
+  val width = int_of_string (get_data tag_width node)
+  val height = int_of_string (get_data tag_height node)
+  method id = id
+  method width = width
+  method height = height
+end
 
-XML bio = {
-  "text" = DATA;
-  "portraits" = new enum (get_nodes tag_portrait NODE) (fun x -> new portrait x);
-}
+let write_portrait oc portrait =
+  XML.write_node oc tag_portrait
+    (fun oc ->
+       lwt () = XML.write_data oc tag_id (string_of_id portrait#id) in
+       lwt () = XML.write_data oc tag_width (string_of_int portrait#width) in
+       lwt () = XML.write_data oc tag_height (string_of_int portrait#height) in
+       return ())
 
-XML restriction = {
-  "catalogues" = split ',' DATA;
-  "forbidden" = (try split_space_coma DATA with Not_found -> []);
-  "allowed" = (try split_space_coma DATA with Not_found -> []);
-}
+let portraits = Weak_cache.create 1024
 
-XML similar_artist = {
-  "name" = DATA;
-  "id" = id_of_string DATA;
-  "portrait" = id_of_string DATA;
-  "genres" = split ',' DATA;
-  "years-active" = List.map int_of_string (split ',' DATA);
-  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction x);
-}
+let make_portrait node =
+  let id = id_of_string (get_data tag_id node) in
+  Weak_cache.find portraits id (fun () -> new portrait node id)
 
-class file node = object
-  val id = lazy(id_of_string (get_data tag_id node))
-  method id = Lazy.force id
-  val format = lazy(
+let make_portrait_option node =
+  if Tag_map.is_empty node.datas then
+    None
+  else begin
+    let id = id_of_string (get_data tag_id node) in
+    Some (Weak_cache.find portraits id (fun () -> new portrait node id))
+  end
+
+class biography node = object
+  val text = get_data tag_text node
+  val portraits = List.map make_portrait (get_nodes tag_portrait (get_node tag_portraits node))
+  method text = text
+  method portraits = portraits
+end
+
+let write_biography oc bio =
+  XML.write_node oc tag_bio
+    (fun oc ->
+       lwt () = XML.write_data oc tag_text bio#text in
+       lwt () = XML.write_nodes oc tag_portraits write_portrait bio#portraits in
+       return ())
+
+class restriction node = object
+  val catalogues = split ',' (get_data tag_catalogues node)
+  val forbidden = try split_space_coma (get_data tag_forbidden node) with Not_found -> []
+  val allowed = try split_space_coma (get_data tag_allowed node) with Not_found -> []
+  method catalogues = catalogues
+  method forbidden = forbidden
+  method allowed = allowed
+end
+
+let write_restriction oc restriction =
+  XML.write_node oc tag_restriction
+    (fun oc ->
+       lwt () = XML.write_data oc tag_catalogues (String.concat "," restriction#catalogues) in
+       lwt () = XML.write_data oc tag_forbidden (String.concat "," restriction#forbidden) in
+       lwt () = XML.write_data oc tag_allowed (String.concat "," restriction#allowed) in
+       return ())
+
+class similar_artist node (id : id) = object
+  val name = get_data tag_name node
+  val portrait = id_of_string (get_data tag_portrait node)
+  val genres = split ',' (get_data tag_genres node)
+  val years_active = List.map int_of_string (split ',' (get_data tag_years_active node));
+  val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
+  method id = id
+  method name = name
+  method portrait = portrait
+  method genres = genres
+  method years_active = years_active
+  method restrictions = restrictions
+end
+
+let write_similar_artist oc similar_artist =
+  XML.write_node oc tag_similar_artist
+    (fun oc ->
+       lwt () = XML.write_data oc tag_id (string_of_id similar_artist#id) in
+       lwt () = XML.write_data oc tag_name similar_artist#name in
+       lwt () = XML.write_data oc tag_portrait (string_of_id similar_artist#portrait) in
+       lwt () = XML.write_data oc tag_genres (String.concat "," similar_artist#genres) in
+       lwt () = XML.write_data oc tag_years_active (String.concat "," (List.map string_of_int similar_artist#years_active)) in
+       lwt () = XML.write_nodes oc tag_restrictions write_restriction similar_artist#restrictions in
+       return ())
+
+let similar_artists = Weak_cache.create 1024
+
+let make_similar_artist node =
+  let id = id_of_string (get_data tag_id node) in
+  Weak_cache.find similar_artists id (fun () -> new similar_artist node id)
+
+class file node (id : id) = object
+  val format =
     match split ',' (get_data tag_format node) with
       | format :: bitrate :: _ ->
           (format, int_of_string bitrate)
       | _ ->
           raise (Error "invalid file format")
-  )
-  method format = fst (Lazy.force format)
-  method bitrate = snd (Lazy.force format)
+  method id = id
+  method format = fst format
+  method bitrate = snd format
 end
 
-XML alternative = {
-  "id" = id_of_string DATA;
-  "files" = new enum (get_nodes tag_file NODE) (fun x -> new file x);
-  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction x);
+let write_file oc file =
+  XML.write_node oc tag_file
+    (fun oc ->
+       lwt () = XML.write_data oc tag_id (string_of_id file#id) in
+       lwt () = XML.write_data oc tag_format (Printf.sprintf "%s,%d" file#format file#bitrate) in
+       return ())
+
+let files = Weak_cache.create 1024
+
+let make_file node =
+  let id = id_of_string (get_data tag_id node) in
+  Weak_cache.find files id (fun () -> new file node id)
+
+class alternative node (id : id) = object
+  val files = List.map make_file (get_nodes tag_file (get_node tag_files node))
+  val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
+  method id = id
+  method files = files
+  method restrictions = restrictions
+end
+
+let write_alternative oc alternative =
+  XML.write_node oc tag_track
+    (fun oc ->
+       lwt () = XML.write_data oc tag_id (string_of_id alternative#id) in
+       lwt () = XML.write_nodes oc tag_files write_file alternative#files in
+       lwt () = XML.write_nodes oc tag_restrictions write_restriction alternative#restrictions in
+       return ())
+
+let alternatives = Weak_cache.create 1024
+
+let make_alternative node =
+  let id = id_of_string (get_data tag_id node) in
+  Weak_cache.find alternatives id (fun () -> new alternative node id)
+
+let make_external_id node =
+  (get_data tag_type node, get_data tag_id node)
+
+let write_external_id oc (t, i) =
+  XML.write_node oc tag_external_id
+    (fun oc ->
+       lwt () = XML.write_data oc tag_type t in
+       lwt () = XML.write_data oc tag_id i in
+       return ())
+
+class track_common node (id : id) = object
+  val title = get_data tag_title node
+  val explicit = try bool_of_string (get_data tag_explicit node) with Not_found -> false
+  val artists = get_datas tag_artist node
+  val artists_id = List.map id_of_string (get_datas tag_artist_id node)
+  val number = int_of_string (get_data tag_track_number node)
+  val length = float (int_of_string (get_data tag_length node)) /. 1000.
+  val files = List.map make_file (get_nodes tag_file (get_node tag_files node))
+  val popularity = float_of_string (get_data tag_popularity node)
+  val external_ids = List.map (fun node -> make_external_id node) (get_nodes tag_external_id (get_node tag_external_ids node))
+  val alternatives = try List.map make_alternative (get_nodes tag_track (get_node tag_alternatives node)) with Not_found -> []
+  method id = id
+  method title = title
+  method explicit = explicit
+  method artists = artists
+  method artists_id = artists_id
+  method number = number
+  method length = length
+  method files = files
+  method popularity = popularity
+  method external_ids = external_ids
+  method alternatives = alternatives
+end
+
+class track node (id : id) = object
+  inherit track_common node id
+  val album = get_data tag_album node
+  val album_id = id_of_string (get_data tag_album_id node)
+  val album_artist = get_data tag_album_artist node
+  val album_artist_id = id_of_string (get_data tag_album_artist_id node)
+  val cover = id_of_string (get_data tag_cover node)
+  val year = int_of_string (get_data tag_year node)
+  method album = album
+  method album_id = album_id
+  method album_artist = album_artist
+  method album_artist_id = album_artist_id
+  method cover = cover
+  method year = year
+end
+
+type album_temp = {
+  at_name : string;
+  at_id : id;
+  at_artist : string;
+  at_artist_id : id;
+  at_cover : id;
+  at_year : int;
 }
 
-XML track = {
-  "id" = id_of_string DATA;
-  "redirect" = id_of_string DATA;
-  "title" = DATA;
-  "explicit" = DATA = "true";
-  "artist" = DATA;
-  "artist-id" = id_of_string DATA;
-  "album" = DATA;
-  "album-id" = id_of_string DATA;
-  "album-artist" = DATA;
-  "album-artist-id" = id_of_string DATA;
-  "track-number" = int_of_string DATA;
-  "length" = float (int_of_string DATA) /. 1000.;
-  "files" = new enum (get_nodes tag_file NODE) (fun x -> new file x);
-  "cover" = id_of_string DATA;
-  "year" = int_of_string DATA;
-  "popularity" = float_of_string DATA;
-  "external-ids" = new enum (get_nodes tag_external_id NODE) (fun x -> (get_data tag_type x, get_data tag_id x));
-  "alternatives" = new enum (try get_nodes tag_track NODE with Not_found -> [||]) (fun x -> new alternative x)
+class track_from_album node id album = object
+  inherit track_common node id
+  method album = album.at_name
+  method album_id = album.at_id
+  method album_artist = album.at_artist
+  method album_artist_id = album.at_artist_id
+  method cover = album.at_cover
+  method year = album.at_year
+end
+
+let write_track oc track =
+  XML.write_node oc tag_track
+    (fun oc ->
+       lwt () = XML.write_data oc tag_id (string_of_id track#id) in
+       lwt () = XML.write_data oc tag_title track#title in
+       lwt () = XML.write_data oc tag_explicit (string_of_bool track#explicit) in
+       lwt () = Lwt_list.iter_s (XML.write_data oc tag_artist) track#artists in
+       lwt () = Lwt_list.iter_s (XML.write_data oc tag_artist_id) (List.map string_of_id track#artists_id) in
+       lwt () = XML.write_data oc tag_album track#album in
+       lwt () = XML.write_data oc tag_album_id (string_of_id track#album_id) in
+       lwt () = XML.write_data oc tag_album_artist track#album_artist in
+       lwt () = XML.write_data oc tag_album_artist_id (string_of_id track#album_artist_id) in
+       lwt () = XML.write_data oc tag_track_number (string_of_int track#number) in
+       lwt () = XML.write_data oc tag_length (string_of_int (int_of_float (track#length *. 1000.))) in
+       lwt () = XML.write_nodes oc tag_files write_file track#files in
+       lwt () = XML.write_data oc tag_cover (string_of_id track#cover) in
+       lwt () = XML.write_data oc tag_year (string_of_int track#year) in
+       lwt () = XML.write_data oc tag_popularity (string_of_float track#popularity) in
+       lwt () = XML.write_nodes oc tag_external_ids write_external_id track#external_ids in
+       lwt () = XML.write_nodes oc tag_alternatives write_alternative track#alternatives in
+       return ())
+
+let tracks = Weak_cache.create 1024
+
+let make_track node =
+  let id = id_of_string (get_data tag_id node) in
+  Weak_cache.find tracks id (fun () -> new track node id)
+
+let make_track_from_album album node =
+  let id = id_of_string (get_data tag_id node) in
+  Weak_cache.find tracks id (fun () -> new track_from_album node id album)
+
+class disc_common node = object
+  val number = int_of_string (get_data tag_disc_number node)
+  val name = try Some (get_data tag_name node) with Not_found -> None
+  method number = number
+  method name = name
+end
+
+class disc node album = object
+  inherit disc_common node
+  val tracks = List.map (make_track_from_album album) (get_nodes tag_track node)
+  method tracks = tracks
+end
+
+let disc_from_cache node get_tracks =
+  lwt tracks = get_tracks (List.map id_of_string (get_datas tag_track node)) in
+  return (object
+            inherit disc_common node
+            method tracks = tracks
+          end)
+
+let write_track_id oc track =
+  XML.write_data oc tag_track (string_of_id track#id)
+
+let write_disc oc disc =
+  XML.write_node oc tag_disc
+    (fun oc ->
+       lwt () = XML.write_data oc tag_disc_number (string_of_int disc#number) in
+       lwt () = XML.write_data oc tag_name (match disc#name with Some name -> name | None -> "") in
+       lwt () = XML.write_nodes oc tag_tracks write_track_id disc#tracks in
+       return ())
+
+let album_temp node id = {
+  at_name = get_data tag_name node;
+  at_id = id;
+  at_artist = get_data tag_artist node;
+  at_artist_id = id_of_string (get_data tag_artist_id node);
+  at_cover = id_of_string (get_data tag_cover node);
+  at_year = int_of_string (get_data tag_year node);
 }
 
-XML disc = {
-  "disc-number" = int_of_string DATA;
-  "name" = (try Some DATA with Not_found -> None);
-  "tracks" = new enum NODES (fun x -> new track x);
-}
-
-XML album = {
-  "name" = DATA;
-  "id" = id_of_string DATA;
-  "artist" = DATA;
-  "artist-id" = id_of_string DATA;
-  "album-type" = DATA;
-  "year" = int_of_string DATA;
-  "cover" = id_of_string DATA;
-  "copyrights" = begin
+class album_common node at (id : id) = object
+  val name = at.at_name
+  val artist = at.at_artist
+  val artist_id = at.at_artist_id
+  val album_type = get_data tag_album_type node
+  val year = at.at_year
+  val cover = at.at_cover
+  val copyrights =
     let node = get_node tag_copyright node in
-    let a = Array.append (get_datas tag_c node) (get_datas tag_p node) in
-    new enum a (fun x -> x)
-  end;
-  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction x);
-  "external-ids" = new enum (get_nodes tag_external_id NODE) (fun x -> (get_data tag_type x, get_data tag_id x));
-  "discs" = new enum (get_nodes tag_disc NODE) (fun x -> new disc x);
-}
+    List.map (fun c -> ("c", c)) (get_datas tag_c node) @ List.map (fun c -> ("p", c)) (get_datas tag_p node)
+  val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
+  val external_ids = try List.map (fun node -> make_external_id node) (get_nodes tag_external_id (get_node tag_external_ids node)) with Not_found -> []
+  method id = id
+  method name = name
+  method artist = artist
+  method artist_id = artist_id
+  method album_type = album_type
+  method year = year
+  method cover = cover
+  method copyrights = copyrights
+  method restrictions = restrictions
+  method external_ids = external_ids
+end
 
-XML artist = {
-  "name" = DATA;
-  "id" = id_of_string DATA;
-  "portrait" = new portrait NODE;
-  "bios" = new enum (get_nodes tag_bio NODE) (fun x -> new bio x);
-  "similar-artists" = new enum (get_nodes tag_similar_artist NODE) (fun x -> new similar_artist x);
-  "genres" = split ',' DATA;
-  "years-active" = List.map int_of_string (split ',' DATA);
-  "albums" = new enum (get_nodes tag_album NODE) (fun x -> new album x);
-}
+class album node (id : id) =
+  let at = album_temp node id in
+object
+  inherit album_common node at id
+  val discs = List.map (fun node -> new disc node at) (get_nodes tag_disc (get_node tag_discs node))
+  method discs = discs
+end
 
-XML artist_search = {
-  "id" = id_of_string DATA;
-  "name" = DATA;
-  "portrait" = new portrait NODE;
-  "popularity" = float_of_string DATA;
-  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction x);
-}
+let album_from_cache node get_tracks =
+  lwt discs = Lwt_list.map_p (fun node -> disc_from_cache node get_tracks) (get_nodes tag_disc (get_node tag_discs node)) in
+  let id = id_of_string (get_data tag_id node) in
+  return (object
+            inherit album_common node (album_temp node id) id
+            method discs = discs
+          end)
 
-XML album_search = {
-  "id" = id_of_string DATA;
-  "name" = DATA;
-  "artist" = get_data tag_artist_name node;
-  "artist-id" = id_of_string DATA;
-  "cover" = id_of_string DATA;
-  "popularity" = float_of_string DATA;
-  "restrictions" = new enum (get_nodes tag_restriction NODE) (fun x -> new restriction x);
-  "external-ids" = new enum (get_nodes tag_external_id NODE) (fun x -> (get_data tag_type x, get_data tag_id x));
-}
+let write_copyright oc (kind, data) =
+  XML.write_data oc
+    (match kind with
+       | "c" -> tag_c
+       | "p" -> tag_p
+       | _ -> assert false)
+    data
 
-XML search_result = {
-  "did-you-mean" = (try Some DATA with Not_found -> None);
-  "total-artists" = int_of_string DATA;
-  "total-albums" = int_of_string DATA;
-  "total-tracks" = int_of_string DATA;
-  "artists" = new enum (get_nodes tag_artist NODE) (fun x -> new artist_search x);
-  "albums" = new enum (get_nodes tag_album NODE) (fun x -> new album_search x);
-  "tracks" = new enum (get_nodes tag_track NODE) (fun x -> new track x);
-}
+let write_album oc album =
+  XML.write_node oc tag_album
+    (fun oc ->
+       lwt () = XML.write_data oc tag_id (string_of_id album#id) in
+       lwt () = XML.write_data oc tag_name album#name in
+       lwt () = XML.write_data oc tag_artist album#artist in
+       lwt () = XML.write_data oc tag_artist_id (string_of_id album#artist_id) in
+       lwt () = XML.write_data oc tag_album_type album#album_type in
+       lwt () = XML.write_data oc tag_year (string_of_int album#year) in
+       lwt () = XML.write_data oc tag_cover (string_of_id album#cover) in
+       lwt () = XML.write_nodes oc tag_copyright write_copyright album#copyrights in
+       lwt () = XML.write_nodes oc tag_restrictions write_restriction album#restrictions in
+       lwt () = XML.write_nodes oc tag_external_ids write_external_id album#external_ids in
+       lwt () = XML.write_nodes oc tag_discs write_disc album#discs in
+       return ())
+
+let albums = Weak_cache.create 1024
+
+let make_album node =
+  let id = id_of_string (get_data tag_id node) in
+  Weak_cache.find albums id (fun () -> new album node id)
+
+class artist_common node (id : id) = object
+  val name = get_data tag_name node
+  val portrait = make_portrait (get_node tag_portrait node)
+  val biographies = List.map (fun node -> new biography node) (get_nodes tag_bio (get_node tag_bios node))
+  val similar_artists = List.map make_similar_artist (get_nodes tag_similar_artist (get_node tag_similar_artists node))
+  val genres = split ',' (get_data tag_genres node)
+  val years_active = List.map int_of_string (split ',' (get_data tag_years_active node))
+  method id = id
+  method name = name
+  method portrait = portrait
+  method biographies = biographies
+  method similar_artists = similar_artists
+  method genres = genres
+  method years_active = years_active
+end
+
+class artist node (id : id) = object
+  inherit artist_common node id
+  val albums = List.map make_album (get_nodes tag_album (get_node tag_albums node))
+  method albums = albums
+end
+
+let artist_from_cache node get_album =
+  lwt albums = Lwt_list.map_p (fun str -> get_album (id_of_string str)) (get_datas tag_album (get_node tag_albums node)) in
+  let id = id_of_string (get_data tag_id node) in
+  return (object
+            inherit artist_common node id
+            method albums = albums
+          end)
+
+let write_album_id oc album =
+  XML.write_data oc tag_album (string_of_id album#id)
+
+let write_artist oc artist =
+  XML.write_node oc tag_artist
+    (fun oc ->
+       lwt () = XML.write_data oc tag_id (string_of_id artist#id) in
+       lwt () = XML.write_data oc tag_name artist#name in
+       lwt () = write_portrait oc artist#portrait in
+       lwt () = XML.write_nodes oc tag_bios write_biography artist#biographies in
+       lwt () = XML.write_nodes oc tag_similar_artists write_similar_artist artist#similar_artists in
+       lwt () = XML.write_data oc tag_genres (String.concat "," artist#genres) in
+       lwt () = XML.write_data oc tag_years_active (String.concat "," (List.map string_of_int artist#years_active)) in
+       lwt () = XML.write_nodes oc tag_albums write_album_id artist#albums in
+       return ())
+
+let artists = Weak_cache.create 1024
+
+let make_artist node =
+  let id = id_of_string (get_data tag_id node) in
+  Weak_cache.find artists id (fun () -> new artist node id)
+
+class artist_search node (id : id) = object
+  val name = get_data tag_name node
+  val portrait = make_portrait_option (get_node tag_portrait node)
+  val popularity = float_of_string (get_data tag_popularity node)
+  val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
+  method id = id
+  method name = name
+  method portrait = portrait
+  method popularity = popularity
+  method restrictions = restrictions
+end
+
+let artist_searchs = Weak_cache.create 1024
+
+let make_artist_search node =
+  let id = id_of_string (get_data tag_id node) in
+  Weak_cache.find artist_searchs id (fun () -> new artist_search node id)
+
+class album_search node (id : id) = object
+  val name = get_data tag_name node
+  val artist = get_data tag_artist_name node
+  val artist_id = id_of_string (get_data tag_artist_id node)
+  val cover = id_of_string (get_data tag_cover node)
+  val popularity = float_of_string (get_data tag_popularity node)
+  val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
+  val external_ids = try List.map (fun node -> make_external_id node) (get_nodes tag_external_id (get_node tag_external_ids node)) with Not_found -> []
+  method id = id
+  method name = name
+  method artist = artist
+  method artist_id = artist_id
+  method cover = cover
+  method popularity = popularity
+  method restrictions = restrictions
+  method external_ids = external_ids
+end
+
+let album_searchs = Weak_cache.create 1024
+
+let make_album_search node =
+  let id = id_of_string (get_data tag_id node) in
+  Weak_cache.find album_searchs id (fun () -> new album_search node id)
+
+class search_result node = object
+  val did_you_mean = try Some (get_data tag_did_you_mean node) with Not_found -> None
+  val total_artists = int_of_string (get_data tag_total_artists node)
+  val total_albums = int_of_string (get_data tag_total_albums node)
+  val total_tracks = int_of_string (get_data tag_total_tracks node)
+  val artists = List.map make_artist_search (get_nodes tag_artist (get_node tag_artists node))
+  val albums = List.map make_album_search (get_nodes tag_album (get_node tag_albums node))
+  val tracks = List.map make_track (get_nodes tag_track (get_node tag_tracks node))
+  method did_you_mean = did_you_mean
+  method total_artists = total_artists
+  method total_albums = total_albums
+  method total_tracks = total_tracks
+  method artists = artists
+  method albums = albums
+  method tracks = tracks
+end
+
+(* +-----------------------------------------------------------------+
+   | Saving to the cache                                             |
+   +-----------------------------------------------------------------+ *)
+
+let save_track session track =
+  match_lwt Cache.get_writer session (make_filename ["metadata"; "tracks"; (string_of_id track#id ^ ".xml.gz")]) with
+    | None ->
+        return ()
+    | Some (file, fd) ->
+        let oc = XML.create_writer fd file in
+        try_lwt
+          lwt () = write_track oc track in
+          XML.close oc
+        with exn ->
+          ignore (Lwt_log.error_f ~section ~exn "failed to save metadata for track %S" (string_of_id track#id));
+          XML.abort oc
+
+let save_album session album =
+  match_lwt Cache.get_writer session (make_filename ["metadata"; "albums"; (string_of_id album#id ^ ".xml.gz")]) with
+    | None ->
+        return ()
+    | Some (file, fd) ->
+        let oc = XML.create_writer fd file in
+        lwt () =
+          try_lwt
+            lwt () = write_album oc album in
+            XML.close oc
+          with exn ->
+            ignore (Lwt_log.error_f ~section ~exn "failed to save metadata for album %S" (string_of_id album#id));
+            XML.abort oc
+        in
+        Lwt_list.iter_p (fun disc -> Lwt_list.iter_p (save_track session) disc#tracks) album#discs
+
+let save_artist session artist =
+  match_lwt Cache.get_writer session (make_filename ["metadata"; "artists"; (string_of_id artist#id ^ ".xml.gz")]) with
+    | None ->
+        return ()
+    | Some (file, fd) ->
+        let oc = XML.create_writer fd file in
+        lwt () =
+          try_lwt
+            lwt () = write_artist oc artist in
+            XML.close oc
+          with exn ->
+            ignore (Lwt_log.error_f ~section ~exn "failed to save metadata for artist %S" (string_of_id artist#id));
+            XML.abort oc
+        in
+        Lwt_list.iter_p (save_album session) artist#albums
+
+(* Ensure that a thread terminate before the end of the program. *)
+let delay thread =
+  if state thread = Sleep then begin
+    let node = Lwt_sequence.add_r (fun () -> thread) Lwt_main.exit_hooks in
+    ignore (
+      try_lwt
+        thread
+      finally
+        Lwt_sequence.remove node;
+        return ()
+    )
+  end
 
 (* +-----------------------------------------------------------------+
    | Commands                                                        |
    +-----------------------------------------------------------------+ *)
 
-external inflate : string -> string = "mlspot_inflate"
+let safe_parse name f =
+  try
+    f ()
+  with exn ->
+    ignore (Lwt_log.error_f ~section ~exn "failed to parse %s XML" name);
+    raise (Error (Printf.sprintf "failed to parse %s XML" name))
 
-let browse session ids kind kind_id root xml =
+type fetch_kind = Cache | Fresh
+
+let rec browse session ids kind kind_id =
   if List.exists (fun id -> id_length id <> 16) ids then raise (Wrong_id kind);
-(*  let cache_files = List.map (fun id -> make_filename ["metadata"; kind ^ "s"; string_of_id id ^ ".xml.gz"]) ids in
-  match_lwt Cache.load session cache_file with
-    | Some data ->
-        return (xml (parse_xml root (inflate data)))
-    | None ->*)
-        lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
-        try_lwt
-          let packet = Packet.create () in
-          Packet.add_int16 packet channel_id;
-          Packet.add_int8 packet kind_id;
-          List.iter (ID.add packet) ids;
-          if kind_id = 1 || kind_id = 2 then Packet.add_int32 packet 0;
-          lwt () = send_packet session#session_parameters CMD_BROWSE (Packet.contents packet) in
-          lwt data = channel_waiter in
-(*          lwt () = Cache.save session cache_file data in*)
-          return (xml (parse_xml root (inflate data)))
-        finally
-          release_channel session#session_parameters channel_id;
-          return ()
+  lwt nodes =
+    Lwt_list.map_p
+      (fun id ->
+         let filename = make_filename ["metadata"; kind ^ "s"; string_of_id id ^ ".xml.gz"] in
+         match_lwt Cache.get_reader session filename with
+           | None ->
+               return (Inr id)
+           | Some (file, fd) ->
+               try_lwt
+                 lwt node = XML.parse_compressed_file_descr fd in
+                 return (Inl node)
+               with exn ->
+                 ignore (Lwt_log.warning_f ~section ~exn "failed to read %S from the cache, removing it" filename);
+                 lwt () =
+                   try_lwt
+                     Lwt_unix.unlink file
+                   with Unix.Unix_error (error, _, _) ->
+                     ignore (Lwt_log.error_f ~section ~exn "cannot remove %S: %s" file (Unix.error_message error));
+                     return ()
+                 in
+                 return (Inr id))
+      ids
+  in
+  Lwt_list.map_p
+    (function
+       | Inl node ->
+           return (Cache, node)
+       | Inr id ->
+           lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
+           try_lwt
+             let packet = Packet.create () in
+             Packet.add_int16 packet channel_id;
+             Packet.add_int8 packet kind_id;
+             List.iter (ID.add packet) ids;
+             if kind_id = 1 || kind_id = 2 then Packet.add_int32 packet 0;
+             lwt () = send_packet session#session_parameters CMD_BROWSE (Packet.contents packet) in
+             lwt data = channel_waiter in
+             return (Fresh, XML.parse_compressed_string data)
+           finally
+             release_channel session#session_parameters channel_id;
+             return ())
+    nodes
 
-let get_artist session id =
-  browse session [id] "artist" 1 tag_artist (fun x -> new artist x)
+and get_artist session id =
+  Weak_cache.find_lwt artists id
+    (fun () ->
+       match_lwt browse session [id] "artist" 1 with
+         | [(Fresh, node)] ->
+             let artist = safe_parse "artist" (fun () -> make_artist (get_node tag_artist node)) in
+             delay (save_artist session artist);
+             return artist
+         | [(Cache, node)] ->
+             safe_parse "artist" (fun () -> artist_from_cache (get_node tag_artist node) (get_album session))
+         | _ ->
+             assert false)
 
-let get_album session id =
-  browse session [id] "album" 2 tag_album (fun x -> new album x)
+and get_album session id =
+  Weak_cache.find_lwt albums id
+    (fun () ->
+       match_lwt browse session [id] "album" 2 with
+         | [(Fresh, node)] ->
+             let album = safe_parse "album" (fun () -> make_album (get_node tag_album node)) in
+             delay (save_album session album);
+             return album
+         | [(Cache, node)] ->
+             safe_parse "album" (fun () -> album_from_cache (get_node tag_album node) (get_tracks session))
+         | _ ->
+             assert false)
 
-let get_tracks session ids =
-  browse session ids "track" 3 tag_result (fun x -> (new search_result x)#tracks)
+and get_tracks session ids =
+  Weak_cache.find_multiple_lwt tracks ids
+    (fun ids ->
+       lwt nodes = browse session ids "track" 3 in
+       return
+         (List.flatten
+            (List.map
+              (function
+                 | (Fresh, node) ->
+                     let tracks = safe_parse "track" (fun () -> List.map make_track (get_nodes tag_track (get_node tag_tracks (get_node tag_result node)))) in
+                     delay (Lwt_list.iter_s (save_track session) tracks);
+                     tracks
+                 | (Cache, node) ->
+                     [safe_parse "track" (fun () ->
+                                            let node = get_node tag_track node in
+                                            let id = id_of_string (get_data tag_id node) in
+                                            new track node id)])
+              nodes)))
 
 let get_track session id =
   lwt tracks = get_tracks session [id] in
-  return (tracks#get 0)
+  return (List.hd tracks)
 
 let search session ?(offset = 0) ?(length = 1000) query =
   let len = String.length query in
@@ -1660,7 +2656,9 @@ let search session ?(offset = 0) ?(length = 1000) query =
     Packet.add_string packet query;
     lwt () = send_packet session#session_parameters CMD_SEARCH (Packet.contents packet) in
     lwt data = channel_waiter in
-    return (new search_result (parse_xml tag_result (inflate data)))
+    let search = safe_parse "search result" (fun () -> new search_result (get_node tag_result (XML.parse_compressed_string data))) in
+    delay (Lwt_list.iter_p (save_track session) search#tracks);
+    return search
   finally
     release_channel session#session_parameters channel_id;
     return ()

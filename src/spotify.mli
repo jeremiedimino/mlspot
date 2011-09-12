@@ -85,7 +85,7 @@ val set_cache_dir : session -> string -> unit
 (** {6 IDs} *)
 
 type id
-  (** Type of ids. *)
+  (** Type of ids. Note that ids are comparable using [==]. *)
 
 exception Id_parse_failure
   (** Exception when trying to parse an invalid ID. *)
@@ -100,44 +100,15 @@ exception Wrong_id of string
 val id_length : id -> int
   (** Returns the length of the given ID. *)
 
+val id_hash : id -> int
+  (** Returns the hash of the given id. *)
+
 val id_of_string : string -> id
   (** Convert a string to an ID. The string must be hexencoded and of
       even length. It raises {!Id_parse_failure} on errors. *)
 
 val string_of_id : id -> string
   (** Return the string representation of an ID. *)
-
-(** {6 Enumerations} *)
-
-exception Out_of_bounds
-  (** Exception raised when trying to access an element which is
-      outside the range of an enumeration. *)
-
-(** Type of enumeration of fixed length holding elements of type
-    ['a]. The first argument is an array of elements and the second is
-    a function which maps elemnt of the array. *)
-class ['a] enum : 'b array -> ('b -> 'a) -> object
-  method length : int
-    (** Length of the enumeration. *)
-
-  method get : int -> 'a
-    (** Returns the nth element of the enumeration.
-
-        @raise Out_of_bounds if the index is invalid. *)
-
-  method to_list : 'a list
-    (** Converts the enumeration to a list. *)
-
-  method to_array : 'a array
-    (** Concerts the enumeration to an array. *)
-
-  method iter : ('a -> unit) -> unit
-    (** [iter f] applies [f] on each elements of the enumeration. *)
-
-  method fold : 'b. ('a -> 'b -> 'b) -> 'b -> 'b
-    (** [fold f acc] applies [f] on each elements of the enumeration,
-        accumulating a result. *)
-end
 
 (** {6 Types} *)
 
@@ -147,9 +118,9 @@ class type portrait = object
   method height : int
 end
 
-class type bio = object
+class type biography = object
   method text : string
-  method portraits : portrait enum
+  method portraits : portrait list
 end
 
 class type restriction = object
@@ -164,7 +135,7 @@ class type similar_artist = object
   method portrait : id
   method genres : string list
   method years_active : int list
-  method restrictions : restriction enum
+  method restrictions : restriction list
 end
 
 class type file = object
@@ -175,35 +146,34 @@ end
 
 class type alternative = object
   method id : id
-  method files : file enum
-  method restrictions : restriction enum
+  method files : file list
+  method restrictions : restriction list
 end
 
 class type track = object
   method id : id
-  method redirect : id
   method title : string
   method explicit : bool
-  method artist : string
-  method artist_id : id
+  method artists : string list
+  method artists_id : id list
   method album : string
   method album_id : id
   method album_artist : string
   method album_artist_id : id
   method year : int
-  method track_number : int
+  method number : int
   method length : float
-  method files : file enum
+  method files : file list
   method cover : id
   method popularity : float
-  method external_ids : (string * string) enum
-  method alternatives : alternative enum
+  method external_ids : (string * string) list
+  method alternatives : alternative list
 end
 
 class type disc = object
-  method disc_number : int
+  method number : int
   method name : string option
-  method tracks : track enum
+  method tracks : track list
 end
 
 class type album = object
@@ -214,29 +184,29 @@ class type album = object
   method album_type : string
   method year : int
   method cover : id
-  method copyrights : string enum
-  method restrictions : restriction enum
-  method external_ids : (string * string) enum
-  method discs : disc enum
+  method copyrights : (string * string) list
+  method restrictions : restriction list
+  method external_ids : (string * string) list
+  method discs : disc list
 end
 
 class type artist = object
   method name : string
   method id : id
   method portrait : portrait
-  method bios : bio enum
-  method similar_artists : similar_artist enum
+  method biographies : biography list
+  method similar_artists : similar_artist list
   method genres : string list
   method years_active : int list
-  method albums : album enum
+  method albums : album list
 end
 
 class type artist_search = object
   method id : id
   method name : string
-  method portrait : portrait
+  method portrait : portrait option
   method popularity : float
-  method restrictions : restriction enum
+  method restrictions : restriction list
 end
 
 class type album_search = object
@@ -246,8 +216,8 @@ class type album_search = object
   method artist_id : id
   method cover : id
   method popularity : float
-  method restrictions : restriction enum
-  method external_ids : (string * string) enum
+  method restrictions : restriction list
+  method external_ids : (string * string) list
 end
 
 class type search_result = object
@@ -263,9 +233,9 @@ class type search_result = object
   method total_tracks : int
     (** The total number of tracks that match the query. *)
 
-  method artists : artist_search enum
-  method albums : album_search enum
-  method tracks : track enum
+  method artists : artist_search list
+  method albums : album_search list
+  method tracks : track list
 end
 
 (** {6 Commands} *)
@@ -282,7 +252,7 @@ val get_track : session -> id -> track Lwt.t
   (** [get_track session id] returns the track whose ID is [id]. [id]
       must be of length 16. *)
 
-val get_tracks : session -> id list -> track enum Lwt.t
+val get_tracks : session -> id list -> track list Lwt.t
   (** [get_track session ids] returns the tracks whose ID are
       [ids]. [ids] must all be of length 16. *)
 

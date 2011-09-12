@@ -36,23 +36,25 @@ total tracks: %d
 
   lwt () = Lwt_io.printf "\nartist results:\n" in
   lwt () =
-    for_lwt i = 0 to search#artists#length - 1 do
-      Lwt_io.printlf "  %s" (search#artists#get i)#name
-    done
+    Lwt_list.iter_s
+      (fun artist -> Lwt_io.printlf "  %s" artist#name)
+      search#artists
   in
 
   lwt () = Lwt_io.printf "\nalbum results:\n" in
   lwt () =
-    for_lwt i = 0 to search#albums#length - 1 do
-      Lwt_io.printlf "  %s" (search#albums#get i)#name
-    done
+    Lwt_list.iter_s
+      (fun album -> Lwt_io.printlf "  %s" album#name)
+      search#albums
   in
 
   lwt () = Lwt_io.printf "\ntrack results:\n" in
   lwt () =
-    for_lwt i = 0 to search#tracks#length - 1 do
-      Lwt_io.printlf "  %s" (search#tracks#get i)#title
-    done
+    Lwt_list.iter_s
+      (fun track -> Lwt_io.printlf "  %s" track#title)
+      search#tracks
   in
+
+  lwt _ = Spotify.get_artist session (List.hd search#artists)#id in
 
   return ()

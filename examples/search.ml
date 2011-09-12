@@ -55,6 +55,4 @@ total tracks: %d
       search#tracks
   in
 
-  lwt _ = Spotify.get_artist session (List.hd search#artists)#id in
-
   return ()

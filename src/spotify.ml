@@ -576,83 +576,141 @@ let recv_packet sp =
    +-----------------------------------------------------------------+ *)
 
 module Cache = struct
+  let released = Lwt_condition.create ()
+
+  (* Allow only 128 threads to use the cache at the same time. *)
+  let available = ref 128
+
+  (* How much time to sleep in case of too many open files. *)
+  let too_many_open_files_delay = 0.1
+
+  let rec acquire () =
+    if !available > 0 then begin
+      decr available;
+      return ()
+    end else
+      lwt () = Lwt_condition.wait released in
+      acquire ()
+
+  let release () =
+    incr available;
+    Lwt_condition.signal released ()
+
+  let with_lock f =
+    lwt () = acquire () in
+    try_lwt
+      f ()
+    finally
+      release ();
+      return ()
+
   let contains session name =
     if session#get_use_cache then
       Sys.file_exists (Filename.concat session#get_cache_dir name)
     else
       false
 
-  let load session name =
+  let rec load session name =
     if session#get_use_cache then
       let filename = Filename.concat session#get_cache_dir name in
       try_lwt
-        Lwt_io.with_file ~mode:Lwt_io.input filename Lwt_io.read >|= fun x -> Some x
-      with Unix.Unix_error (error, _, _) ->
-        ignore (Lwt_log.debug_f ~section "failed to load %S from the cache: %s" name (Unix.error_message error));
-        return None
+        with_lock (fun () -> Lwt_io.with_file ~mode:Lwt_io.input filename Lwt_io.read >|= fun x -> Some x)
+      with
+        | Unix.Unix_error (Unix.EMFILE, _, _) ->
+            lwt () = Lwt_unix.sleep too_many_open_files_delay in
+            load session name
+        | Unix.Unix_error (error, _, _) ->
+            ignore (Lwt_log.debug_f ~section "failed to load %S from the cache: %s" name (Unix.error_message error));
+            return None
     else
       return None
 
-  let save session name data =
+  let rec mkdirp dir =
+    try_lwt
+      lwt () = Lwt_unix.access dir [Unix.F_OK] in
+      return true
+    with Unix.Unix_error _ ->
+      lwt ok = mkdirp (Filename.dirname dir) in
+      if ok then
+        try_lwt
+          lwt () = Lwt_unix.mkdir dir 0o755 in
+          return true
+        with
+          | Unix.Unix_error (Unix.EEXIST, _, _) ->
+              return true
+          | Unix.Unix_error (error, _, _) ->
+              ignore (Lwt_log.error_f ~section "failed to make directory %S: %s" dir (Unix.error_message error));
+              return false
+      else
+        return false
+
+  let rec save session name data =
     if session#get_use_cache then
       let filename = Filename.concat session#get_cache_dir name in
       if Sys.file_exists filename then
         return ()
       else
         try_lwt
-          let rec loop dir =
-            try_lwt
-              Lwt_unix.access dir [Unix.F_OK]
-            with Unix.Unix_error _ ->
-              lwt () = loop (Filename.dirname dir) in
-              try_lwt
-                Lwt_unix.mkdir dir 0o755
-              with Unix.Unix_error (Unix.EEXIST, _, _) ->
-                return ()
-          in
-          lwt () = loop (Filename.dirname filename) in
-          Lwt_io.with_file ~mode:Lwt_io.output filename (fun oc -> Lwt_io.write oc data)
-        with Unix.Unix_error (error, _, _) ->
-          ignore (Lwt_log.error_f ~section "failed to save %S to the cache: %s" name (Unix.error_message error));
-          return ()
+          lwt ok = mkdirp (Filename.dirname filename) in
+          if ok then
+            with_lock (fun () -> Lwt_io.with_file ~mode:Lwt_io.output filename (fun oc -> Lwt_io.write oc data))
+          else
+            return ()
+        with
+          | Unix.Unix_error (Unix.EMFILE, _, _) ->
+              lwt () = Lwt_unix.sleep too_many_open_files_delay in
+              save session name data
+          | Unix.Unix_error (error, _, _) ->
+              ignore (Lwt_log.error_f ~section "failed to save %S to the cache: %s" name (Unix.error_message error));
+              return ()
     else
       return ()
 
-  let get_reader session name =
+  let rec get_reader session name =
     if session#get_use_cache then
       let filename = Filename.concat session#get_cache_dir name in
+      lwt () = acquire () in
       try_lwt
         lwt fd = Lwt_unix.openfile filename [Unix.O_RDONLY] 0 in
         return (Some (filename, fd))
-      with Unix.Unix_error (error, _, _) ->
-        ignore (Lwt_log.debug_f ~section "failed to open %S from the cache for reading: %s" name (Unix.error_message error));
-        return None
+      with
+        | Unix.Unix_error (Unix.ENOENT, _, _) ->
+            release ();
+            return None
+        | Unix.Unix_error (Unix.EMFILE, _, _) ->
+            release ();
+            lwt () = Lwt_unix.sleep too_many_open_files_delay in
+            get_reader session name
+        | Unix.Unix_error (error, _, _) ->
+            release ();
+            ignore (Lwt_log.error_f ~section "failed to open %S from the cache for reading: %s" name (Unix.error_message error));
+            return None
     else
       return None
 
-  let get_writer session name =
+  let rec get_writer session name =
     if session#get_use_cache then
       let filename = Filename.concat session#get_cache_dir name in
       if Sys.file_exists filename then
         return None
       else
+        lwt () = acquire () in
         try_lwt
-          let rec loop dir =
-            try_lwt
-              Lwt_unix.access dir [Unix.F_OK]
-            with Unix.Unix_error _ ->
-              lwt () = loop (Filename.dirname dir) in
-              try_lwt
-                Lwt_unix.mkdir dir 0o755
-              with Unix.Unix_error (Unix.EEXIST, _, _) ->
-                return ()
-          in
-          lwt () = loop (Filename.dirname filename) in
-          lwt fd = Lwt_unix.openfile filename [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o644 in
-          return (Some (filename, fd))
-        with Unix.Unix_error (error, _, _) ->
-          ignore (Lwt_log.error_f "failed to open %S from the cache for writing: %s" name (Unix.error_message error));
-          return None
+          lwt ok = mkdirp (Filename.dirname filename) in
+          if ok then
+            lwt fd = Lwt_unix.openfile filename [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o644 in
+            return (Some (filename, fd))
+          else
+            return None
+        with
+          | Unix.Unix_error (Unix.EMFILE, _, _) ->
+              release ();
+              lwt () = Lwt_unix.sleep too_many_open_files_delay in
+              get_writer session name
+          | Unix.Unix_error (error, _, _) ->
+              release ();
+              ignore (Lwt_log.error_f "failed to open %S from the cache for writing: %s" name (Unix.error_message error));
+              return None
     else
       return None
 end
@@ -2489,6 +2547,9 @@ let save_track session track =
         with exn ->
           ignore (Lwt_log.error_f ~section ~exn "failed to save metadata for track %S" (string_of_id track#id));
           XML.abort oc
+        finally
+          Cache.release ();
+          return ()
 
 let save_album session album =
   match_lwt Cache.get_writer session (make_filename ["metadata"; "albums"; (string_of_id album#id ^ ".xml.gz")]) with
@@ -2503,6 +2564,9 @@ let save_album session album =
           with exn ->
             ignore (Lwt_log.error_f ~section ~exn "failed to save metadata for album %S" (string_of_id album#id));
             XML.abort oc
+          finally
+            Cache.release ();
+            return ()
         in
         Lwt_list.iter_p (fun disc -> Lwt_list.iter_p (save_track session) disc#tracks) album#discs
 
@@ -2519,6 +2583,9 @@ let save_artist session artist =
           with exn ->
             ignore (Lwt_log.error_f ~section ~exn "failed to save metadata for artist %S" (string_of_id artist#id));
             XML.abort oc
+          finally
+            Cache.release ();
+            return ()
         in
         Lwt_list.iter_p (save_album session) artist#albums
 
@@ -2570,7 +2637,10 @@ let rec browse session ids kind kind_id =
                      ignore (Lwt_log.error_f ~section ~exn "cannot remove %S: %s" file (Unix.error_message error));
                      return ()
                  in
-                 return (Inr id))
+                 return (Inr id)
+               finally
+                 Cache.release ();
+                 return ())
       ids
   in
   Lwt_list.map_p

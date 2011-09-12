@@ -1054,13 +1054,13 @@ let login session ~username ~password =
     lwt () = Lwt_io.read_into_exactly ic server_random 0 2 in
 
     if server_random.[0] <> '\x00' then begin
-      match server_random.[1] with
-        | '\x01' -> raise (Authentication_failure "client upgrade recquired")
-        | '\x03' -> raise (Authentication_failure "user not found")
-        | '\x04' -> raise (Authentication_failure "account has been disabled")
-        | '\x06' -> raise (Authentication_failure "you need to complete your account details")
-        | '\x09' -> raise (Authentication_failure "country mismatch")
-        | _ -> raise (Authentication_failure "unknown error")
+      match Char.code server_random.[1] with
+        | 0x01 -> raise (Authentication_failure "client upgrade recquired")
+        | 0x03 -> raise (Authentication_failure "user not found")
+        | 0x04 -> raise (Authentication_failure "account has been disabled")
+        | 0x06 -> raise (Authentication_failure "you need to complete your account details")
+        | 0x09 -> raise (Authentication_failure "country mismatch")
+        | code -> raise (Authentication_failure (Printf.sprintf "unknown error (%d)" code))
     end;
 
     (* Read remaining 14 random bytes. *)

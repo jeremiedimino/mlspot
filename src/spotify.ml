@@ -11,19 +11,23 @@ open Lwt
 
 let section = Lwt_log.Section.make "spotify"
 
+(* +-----------------------------------------------------------------+
+   | Misc                                                            |
+   +-----------------------------------------------------------------+ *)
+
 type ('a, 'b) either =
   | Inl of 'a
   | Inr of 'b
 
-let rec split l =
+let rec split_either l =
   match l with
     | [] ->
         ([], [])
     | Inl x :: l ->
-        let (a, b) = split l in
+        let (a, b) = split_either l in
         (x :: a, b)
     | Inr x :: l ->
-        let (a, b) = split l in
+        let (a, b) = split_either l in
         (a, x :: b)
 
 let rec make_filename l =
@@ -44,6 +48,31 @@ let xdg_cache_home =
       make_filename [home; "Local Settings"; "Cache"]
     else
       Filename.concat home ".cache"
+
+let split sep str =
+  let rec loop i j =
+    if j = String.length str then
+      [String.sub str i (j - i)]
+    else
+      if str.[j] = sep then
+        String.sub str i (j - i) :: loop (j + 1) (j + 1)
+      else
+        loop i (j + 1)
+  in
+  loop 0 0
+
+let split_space_coma str =
+  let rec loop i j =
+    if j = String.length str then
+      [String.sub str i (j - i)]
+    else
+      match str.[j] with
+        | ' ' | ',' ->
+            String.sub str i (j - i) :: loop (j + 1) (j + 1)
+        | _ ->
+            loop i (j + 1)
+  in
+  loop 0 0
 
 (* +-----------------------------------------------------------------+
    | Cache versions                                                  |
@@ -1233,7 +1262,11 @@ module ID : sig
   val of_string : string -> t
   val to_string : t -> string
 
-  val add : Packet.t -> t -> unit
+  val to_bytes : t -> string
+    (* Warning: the result must not be modified. *)
+
+  val of_bytes : string -> t
+    (* Warning: the string must not be modified. *)
 end = struct
 
   type t = {
@@ -1255,6 +1288,9 @@ end = struct
   let length id = String.length id.bytes
   let hash id = id.hash
 
+  let to_bytes id = id.bytes
+  let of_bytes bytes = IDs.merge ids { bytes; hash = Hashtbl.hash bytes }
+
   let int_of_hexa = function
     | '0' .. '9' as ch -> Char.code ch - Char.code '0'
     | 'a' .. 'f' as ch -> Char.code ch - Char.code 'a' + 10
@@ -1270,7 +1306,7 @@ end = struct
       let x1 = int_of_hexa (String.unsafe_get str (i * 2 + 1)) in
       String.unsafe_set bytes i (Char.unsafe_chr ((x0 lsl 4) lor x1))
     done;
-    IDs.merge ids { bytes; hash = Hashtbl.hash bytes }
+    of_bytes bytes
 
   let hexa_of_int n =
     if n < 10 then
@@ -1287,9 +1323,6 @@ end = struct
       String.unsafe_set str (i * 2 + 1) (hexa_of_int (x land 15))
     done;
     str
-
-  let add packet id =
-    Packet.add_string packet id.bytes
 end
 
 type id = ID.t
@@ -1297,6 +1330,170 @@ let id_length = ID.length
 let id_hash = ID.hash
 let id_of_string = ID.of_string
 let string_of_id = ID.to_string
+
+(* +-----------------------------------------------------------------+
+   | Links                                                           |
+   +-----------------------------------------------------------------+ *)
+
+type uri = string
+
+let base62_alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+let base62_of_code x = base62_alphabet.[x]
+
+let code_of_base62 = function
+  | '0' -> 0
+  | '1' -> 1
+  | '2' -> 2
+  | '3' -> 3
+  | '4' -> 4
+  | '5' -> 5
+  | '6' -> 6
+  | '7' -> 7
+  | '8' -> 8
+  | '9' -> 9
+  | 'a' -> 10
+  | 'b' -> 11
+  | 'c' -> 12
+  | 'd' -> 13
+  | 'e' -> 14
+  | 'f' -> 15
+  | 'g' -> 16
+  | 'h' -> 17
+  | 'i' -> 18
+  | 'j' -> 19
+  | 'k' -> 20
+  | 'l' -> 21
+  | 'm' -> 22
+  | 'n' -> 23
+  | 'o' -> 24
+  | 'p' -> 25
+  | 'q' -> 26
+  | 'r' -> 27
+  | 's' -> 28
+  | 't' -> 29
+  | 'u' -> 30
+  | 'v' -> 31
+  | 'w' -> 32
+  | 'x' -> 33
+  | 'y' -> 34
+  | 'z' -> 35
+  | 'A' -> 36
+  | 'B' -> 37
+  | 'C' -> 38
+  | 'D' -> 39
+  | 'E' -> 40
+  | 'F' -> 41
+  | 'G' -> 42
+  | 'H' -> 43
+  | 'I' -> 44
+  | 'J' -> 45
+  | 'K' -> 46
+  | 'L' -> 47
+  | 'M' -> 48
+  | 'N' -> 49
+  | 'O' -> 50
+  | 'P' -> 51
+  | 'Q' -> 52
+  | 'R' -> 53
+  | 'S' -> 54
+  | 'T' -> 55
+  | 'U' -> 56
+  | 'V' -> 57
+  | 'W' -> 58
+  | 'X' -> 59
+  | 'Y' -> 60
+  | 'Z' -> 61
+  | _ -> raise Exit
+
+let base_convert src of_base to_base dst_len =
+  let dst = Array.create dst_len 0 in
+  let rec loop idx len =
+    let divide = ref 0 and newlen = ref 0 in
+    for i = 0 to len - 1 do
+      divide := !divide * of_base + src.(i);
+      if !divide >= to_base then begin
+        src.(!newlen) <- !divide / to_base;
+        incr newlen;
+        divide := !divide mod to_base
+      end else if !newlen > 0 then begin
+        src.(!newlen) <- 0;
+        incr newlen
+      end
+    done;
+    dst.(idx) <- !divide;
+    if !newlen <> 0 then loop (idx - 1) !newlen
+  in
+  loop (dst_len - 1) (Array.length src);
+  dst
+
+let base62_encode bytes len =
+  let src = Array.create (String.length bytes) 0 in
+  for i = 0 to String.length bytes - 1 do
+    src.(i) <- Char.code bytes.[i]
+  done;
+  let dst = base_convert src 256 62 len in
+  let res = String.create len in
+  for i = 0 to len - 1 do
+    res.[i] <- base62_of_code dst.(i)
+  done;
+  res
+
+let base62_decode str len =
+  let src = Array.create (String.length str) 0 in
+  for i = 0 to String.length str - 1 do
+    src.(i) <- code_of_base62 str.[i]
+  done;
+  let dst = base_convert src 62 256 len in
+  let res = String.create len in
+  for i = 0 to len - 1 do
+    res.[i] <- Char.chr dst.(i)
+  done;
+  res
+
+type link =
+  | Track of id
+  | Album of id
+  | Artist of id
+  | Search of string
+  | Playlist of string * id
+  | Image of id
+
+exception Invalid_uri of string
+
+let link_of_uri uri =
+  try
+    match split ':' uri with
+      | ["spotify"; "track"; arg] when String.length arg = 22 ->
+          Track (ID.of_bytes (base62_decode arg 16))
+      | ["spotify"; "album"; arg] when String.length arg = 22 ->
+          Album (ID.of_bytes (base62_decode arg 16))
+      | ["spotify"; "artist"; arg] when String.length arg = 22 ->
+          Artist (ID.of_bytes (base62_decode arg 16))
+      | ["search"; arg] ->
+          Search arg
+      | ["spotify"; "user"; user; "playlist"; arg] when String.length arg = 22 ->
+          Playlist (user, ID.of_bytes (base62_decode arg 16))
+      | ["spotify"; "image"; arg] when String.length arg = 40 ->
+          Image (id_of_string arg)
+      | _ ->
+          raise Exit
+  with _ ->
+    raise (Invalid_uri uri)
+
+let uri_of_link = function
+  | Track id ->
+      String.concat ":" ["spotify"; "track"; base62_encode (ID.to_bytes id) 22]
+  | Album id ->
+      String.concat ":" ["spotify"; "album"; base62_encode (ID.to_bytes id) 22]
+  | Artist id ->
+      String.concat ":" ["spotify"; "artist"; base62_encode (ID.to_bytes id) 22]
+  | Search str ->
+      String.concat ":" ["spotify"; "search"; str]
+  | Playlist (user, id) ->
+      String.concat ":" ["spotify"; "user"; user; "playlist"; base62_encode (ID.to_bytes id) 22]
+  | Image id ->
+      String.concat ":" ["spotify"; "image"; string_of_id id]
 
 (* +-----------------------------------------------------------------+
    | XML                                                             |
@@ -2042,7 +2239,7 @@ end = struct
 
   let find_multiple_lwt cache ids make =
     let old_datas, ids =
-      split
+      split_either
         (List.map
            (fun id ->
               try
@@ -2070,35 +2267,11 @@ end
    | Documents                                                       |
    +-----------------------------------------------------------------+ *)
 
-let split sep str =
-  let rec loop i j =
-    if j = String.length str then
-      [String.sub str i (j - i)]
-    else
-      if str.[j] = sep then
-        String.sub str i (j - i) :: loop (j + 1) (j + 1)
-      else
-        loop i (j + 1)
-  in
-  loop 0 0
-
-let split_space_coma str =
-  let rec loop i j =
-    if j = String.length str then
-      [String.sub str i (j - i)]
-    else
-      match str.[j] with
-        | ' ' | ',' ->
-            String.sub str i (j - i) :: loop (j + 1) (j + 1)
-        | _ ->
-            loop i (j + 1)
-  in
-  loop 0 0
-
 class portrait node (id : id) = object
   val width = int_of_string (get_data tag_width node)
   val height = int_of_string (get_data tag_height node)
   method id = id
+  method link = Image id
   method width = width
   method height = height
 end
@@ -2163,6 +2336,7 @@ class similar_artist node (id : id) = object
   val years_active = List.map int_of_string (split ',' (get_data tag_years_active node));
   val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
   method id = id
+  method link = Artist id
   method name = name
   method portrait = portrait
   method genres = genres
@@ -2216,6 +2390,7 @@ class alternative node (id : id) = object
   val files = List.map make_file (get_nodes tag_file (get_node tag_files node))
   val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
   method id = id
+  method link = Track id
   method files = files
   method restrictions = restrictions
 end
@@ -2256,6 +2431,7 @@ class track_common node (id : id) = object
   val external_ids = List.map (fun node -> make_external_id node) (get_nodes tag_external_id (get_node tag_external_ids node))
   val alternatives = try List.map make_alternative (get_nodes tag_track (get_node tag_alternatives node)) with Not_found -> []
   method id = id
+  method link = Track id
   method title = title
   method explicit = explicit
   method artists = artists
@@ -2389,6 +2565,7 @@ class album_common node at (id : id) = object
   val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
   val external_ids = try List.map (fun node -> make_external_id node) (get_nodes tag_external_id (get_node tag_external_ids node)) with Not_found -> []
   method id = id
+  method link = Album id
   method name = name
   method artist = artist
   method artist_id = artist_id
@@ -2455,6 +2632,7 @@ class artist_common node (id : id) = object
   val genres = split ',' (get_data tag_genres node)
   val years_active = List.map int_of_string (split ',' (get_data tag_years_active node))
   method id = id
+  method link = Artist id
   method name = name
   method portrait = portrait
   method biographies = biographies
@@ -2506,6 +2684,7 @@ class artist_search node (id : id) = object
   val popularity = float_of_string (get_data tag_popularity node)
   val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
   method id = id
+  method link = Artist id
   method name = name
   method portrait = portrait
   method popularity = popularity
@@ -2527,6 +2706,7 @@ class album_search node (id : id) = object
   val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
   val external_ids = try List.map (fun node -> make_external_id node) (get_nodes tag_external_id (get_node tag_external_ids node)) with Not_found -> []
   method id = id
+  method link = Album id
   method name = name
   method artist = artist
   method artist_id = artist_id
@@ -2542,7 +2722,7 @@ let make_album_search node =
   let id = id_of_string (get_data tag_id node) in
   Weak_cache.find album_searchs id (fun () -> new album_search node id)
 
-class search_result node = object
+class search_result query node = object
   val did_you_mean = try Some (get_data tag_did_you_mean node) with Not_found -> None
   val total_artists = int_of_string (get_data tag_total_artists node)
   val total_albums = int_of_string (get_data tag_total_albums node)
@@ -2550,6 +2730,7 @@ class search_result node = object
   val artists = List.map make_artist_search (get_nodes tag_artist (get_node tag_artists node))
   val albums = List.map make_album_search (get_nodes tag_album (get_node tag_albums node))
   val tracks = List.map make_track (get_nodes tag_track (get_node tag_tracks node))
+  method link = Search query
   method did_you_mean = did_you_mean
   method total_artists = total_artists
   method total_albums = total_albums
@@ -2695,7 +2876,7 @@ let rec browse session ids kind kind_id root cache_version =
              let packet = Packet.create () in
              Packet.add_int16 packet channel_id;
              Packet.add_int8 packet kind_id;
-             List.iter (ID.add packet) ids;
+             List.iter (fun id -> Packet.add_string packet (ID.to_bytes id)) ids;
              if kind_id = 1 || kind_id = 2 then Packet.add_int32 packet 0;
              lwt () = send_packet session#session_parameters CMD_BROWSE (Packet.contents packet) in
              lwt data = channel_waiter in
@@ -2768,7 +2949,7 @@ let get_image session id =
              try_lwt
                let packet = Packet.create () in
                Packet.add_int16 packet channel_id;
-               ID.add packet id;
+               Packet.add_string packet (ID.to_bytes id);
                lwt () = send_packet session#session_parameters CMD_IMAGE (Packet.contents packet) in
                lwt data = channel_waiter in
                delay (Cache.save session filename data);
@@ -2788,7 +2969,7 @@ let search session ?(offset = 0) ?(length = 1000) query =
     Packet.add_string packet query;
     lwt () = send_packet session#session_parameters CMD_SEARCH (Packet.contents packet) in
     lwt data = channel_waiter in
-    let search = safe_parse "search result" (fun () -> new search_result (get_node tag_result (XML.parse_compressed_string data))) in
+    let search = safe_parse "search result" (fun () -> new search_result query (get_node tag_result (XML.parse_compressed_string data))) in
     delay (Lwt_list.iter_p (save_track session) search#tracks);
     return search
   finally

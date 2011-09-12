@@ -110,10 +110,31 @@ val id_of_string : string -> id
 val string_of_id : id -> string
   (** Return the string representation of an ID. *)
 
+(** {6 Spotify links} *)
+
+(** Type of links. *)
+type link =
+  | Track of id
+  | Album of id
+  | Artist of id
+  | Search of string
+  | Playlist of string * id
+  | Image of id
+
+exception Invalid_uri of string
+  (** Exception raised when trying to parse an invalid uri. *)
+
+val link_of_uri : string -> link
+  (** Create a link from a spotify URI. *)
+
+val uri_of_link : link -> string
+  (** Return the spotify URI of a link. *)
+
 (** {6 Types} *)
 
 class type portrait = object
   method id : id
+  method link : link
   method width : int
   method height : int
 end
@@ -130,8 +151,9 @@ class type restriction = object
 end
 
 class type similar_artist = object
-  method name : string
   method id : id
+  method link : link
+  method name : string
   method portrait : id
   method genres : string list
   method years_active : int list
@@ -146,12 +168,14 @@ end
 
 class type alternative = object
   method id : id
+  method link : link
   method files : file list
   method restrictions : restriction list
 end
 
 class type track = object
   method id : id
+  method link : link
   method title : string
   method explicit : bool
   method artists : string list
@@ -177,8 +201,9 @@ class type disc = object
 end
 
 class type album = object
-  method name : string
   method id : id
+  method link : link
+  method name : string
   method artist : string
   method artist_id : id
   method album_type : string
@@ -191,8 +216,9 @@ class type album = object
 end
 
 class type artist = object
-  method name : string
   method id : id
+  method link : link
+  method name : string
   method portrait : portrait
   method biographies : biography list
   method similar_artists : similar_artist list
@@ -203,6 +229,7 @@ end
 
 class type artist_search = object
   method id : id
+  method link : link
   method name : string
   method portrait : portrait option
   method popularity : float
@@ -211,6 +238,7 @@ end
 
 class type album_search = object
   method id : id
+  method link : link
   method name : string
   method artist : string
   method artist_id : id
@@ -221,6 +249,9 @@ class type album_search = object
 end
 
 class type search_result = object
+  method link : link
+    (** Link to the search. *)
+
   method did_you_mean : string option
     (** Suggestion. *)
 
@@ -265,4 +296,3 @@ val search : session -> ?offset : int -> ?length : int -> string -> search_resul
       search. [offset] represent the offset the first response to get
       in the list of all response. It default to [0]. [length] is the
       maximum number of responses to return. It default to [1000]. *)
-

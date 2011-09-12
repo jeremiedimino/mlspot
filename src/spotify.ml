@@ -1422,19 +1422,35 @@ module XML = struct
     mutable data_data : string list;
   }
 
+  module Datas = Weak.Make (struct
+                              type t = data
+                              let equal = ( = )
+                              let hash = Hashtbl.hash
+                            end)
+
+  let data_cache = Datas.create 16384
+
+  let empty = Datas.merge data_cache ""
+
   let make_data dm =
-    let res = String.create dm.data_size in
-    let rec loop ofs l =
-      match l with
-        | [] ->
-            res
-        | str :: l ->
-            let len = String.length str in
-            let ofs = ofs - len in
-            String.unsafe_blit str 0 res ofs len;
-            loop ofs l
-    in
-    loop dm.data_size dm.data_data
+    match dm.data_data with
+      | [] ->
+          empty
+      | [str] ->
+          Datas.merge data_cache str
+      | _ ->
+          let res = String.create dm.data_size in
+          let rec loop ofs l =
+            match l with
+              | [] ->
+                  Datas.merge data_cache res
+              | str :: l ->
+                  let len = String.length str in
+                  let ofs = ofs - len in
+                  String.unsafe_blit str 0 res ofs len;
+                  loop ofs l
+          in
+          loop dm.data_size dm.data_data
 
   type state = Undefined of string list Tag_map.t | Data of data_maker | Node of node
 
@@ -1476,12 +1492,12 @@ module XML = struct
          match !state with
            | Undefined datas ->
                stack := { nodes = Tag_map.empty; datas } :: !stack;
-               state := Undefined (List.fold_left (fun map (key, value) -> add key value map) Tag_map.empty attrs)
+               state := Undefined (List.fold_left (fun map (key, value) -> add key (Datas.merge data_cache value) map) Tag_map.empty attrs)
            | Data str ->
                raise (Error "cannot mix element and cdata")
            | Node node ->
                stack := node :: !stack;
-               state := Undefined (List.fold_left (fun map (key, value) -> add key value map) Tag_map.empty attrs));
+               state := Undefined (List.fold_left (fun map (key, value) -> add key (Datas.merge data_cache value) map) Tag_map.empty attrs));
     Expat.set_end_element_handler xp
       (fun name ->
          let node =

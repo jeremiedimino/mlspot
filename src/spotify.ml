@@ -1000,9 +1000,6 @@ let login session ~username ~password =
     (* Generate random data. *)
     let client_random = Cryptokit.Random.string rng 16 in
 
-    (* The secure rng is two slow, so we use a pseudo-random one. *)
-    let rng = Cryptokit.Random.pseudo_rng client_random in
-
     (* Generate a secret. *)
     let secret = Cryptokit.DH.private_secret ~rng dh_parameters in
 

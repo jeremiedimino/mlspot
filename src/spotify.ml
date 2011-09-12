@@ -1969,7 +1969,7 @@ end
    +-----------------------------------------------------------------+ *)
 
 module Weak_cache : sig
-  type 'a t constraint 'a = < id : id; .. >
+  type 'a t
     (* Type of object catching element of type ['a], indexed by an
        ID. Element must be finalisable. *)
 
@@ -1987,7 +1987,7 @@ module Weak_cache : sig
   val find_lwt : 'a t -> id -> (unit -> 'a Lwt.t) -> 'a Lwt.t
     (* Same as find but [make] returns a thread. *)
 
-  val find_multiple_lwt : 'a t -> id list -> (id list -> 'a list Lwt.t) -> 'a list Lwt.t
+  val find_multiple_lwt : (< id : id; .. > as 'a) t -> id list -> (id list -> 'a list Lwt.t) -> 'a list Lwt.t
     (* [find_multiple_lwt cache ids make] returns all elements found
        in the cache, creating missing ones with [make]. *)
 end = struct
@@ -1997,12 +1997,12 @@ end = struct
                                  let hash = id_hash
                                end)
 
-  type 'a t = 'a Weak.t Table.t constraint 'a = < id : id; .. >
+  type 'a t = 'a Weak.t Table.t
 
   let create size = Table.create size
 
-  let finalise cache obj =
-    Table.remove cache obj#id
+  let finalise cache id obj =
+    Table.remove cache id
 
   let find cache id make =
     try
@@ -2019,7 +2019,7 @@ end = struct
       let weak = Weak.create 1 in
       Weak.set weak 0 (Some data);
       Table.add cache id weak;
-      Gc.finalise (finalise cache) data;
+      Gc.finalise (finalise cache id) data;
       data
 
   let find_lwt cache id make =
@@ -2037,7 +2037,7 @@ end = struct
       let weak = Weak.create 1 in
       Weak.set weak 0 (Some data);
       Table.add cache id weak;
-      Gc.finalise (finalise cache) data;
+      Gc.finalise (finalise cache id) data;
       return data
 
   let find_multiple_lwt cache ids make =
@@ -2061,7 +2061,7 @@ end = struct
          let weak = Weak.create 1 in
          Weak.set weak 0 (Some data);
          Table.add cache data#id weak;
-         Gc.finalise (finalise cache) data)
+         Gc.finalise (finalise cache data#id) data)
       new_datas;
     return (old_datas @ new_datas)
 end
@@ -2752,6 +2752,27 @@ and get_tracks session ids =
 let get_track session id =
   lwt tracks = get_tracks session [id] in
   return (List.hd tracks)
+
+let images = Weak_cache.create 1024
+
+let get_image session id =
+  if id_length id <> 20 then raise (Wrong_id "image");
+  Weak_cache.find_lwt images id
+    (fun () ->
+       let filename = Filename.concat "images" (string_of_id id ^ ".jpg") in
+       match_lwt Cache.load session filename with
+         | Some data ->
+             return data
+         | None ->
+             lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
+             try_lwt
+               let packet = Packet.create () in
+               Packet.add_int16 packet channel_id;
+               ID.add packet id;
+               lwt () = send_packet session#session_parameters CMD_IMAGE (Packet.contents packet) in
+               lwt data = channel_waiter in
+               delay (Cache.save session filename data);
+               return data)
 
 let search session ?(offset = 0) ?(length = 1000) query =
   let len = String.length query in

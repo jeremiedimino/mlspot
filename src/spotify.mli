@@ -256,6 +256,10 @@ val get_tracks : session -> id list -> track list Lwt.t
   (** [get_track session ids] returns the tracks whose ID are
       [ids]. [ids] must all be of length 16. *)
 
+val get_image : session -> id -> string Lwt.t
+  (** [get_image session id] returns the image whose ID is [id]. [id]
+      must be of length 20. *)
+
 val search : session -> ?offset : int -> ?length : int -> string -> search_result Lwt.t
   (** [search session ?offset ?length query] performs the given
       search. [offset] represent the offset the first response to get

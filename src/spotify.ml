@@ -46,6 +46,14 @@ let xdg_cache_home =
       Filename.concat home ".cache"
 
 (* +-----------------------------------------------------------------+
+   | Cache versions                                                  |
+   +-----------------------------------------------------------------+ *)
+
+let artist_cache_version = 0
+let album_cache_version = 0
+let track_cache_version = 0
+
+(* +-----------------------------------------------------------------+
    | Errors                                                          |
    +-----------------------------------------------------------------+ *)
 
@@ -1295,6 +1303,7 @@ let string_of_id = ID.to_string
    +-----------------------------------------------------------------+ *)
 
 TAGS [
+  "mlspot-cache-version";
   "id";
   "width";
   "height";
@@ -2297,6 +2306,7 @@ end
 let write_track oc track =
   XML.write_node oc tag_track
     (fun oc ->
+       lwt () = XML.write_data oc tag_mlspot_cache_version (string_of_int track_cache_version) in
        lwt () = XML.write_data oc tag_id (string_of_id track#id) in
        lwt () = XML.write_data oc tag_title track#title in
        lwt () = XML.write_data oc tag_explicit (string_of_bool track#explicit) in
@@ -2417,6 +2427,7 @@ let write_copyright oc (kind, data) =
 let write_album oc album =
   XML.write_node oc tag_album
     (fun oc ->
+       lwt () = XML.write_data oc tag_mlspot_cache_version (string_of_int album_cache_version) in
        lwt () = XML.write_data oc tag_id (string_of_id album#id) in
        lwt () = XML.write_data oc tag_name album#name in
        lwt () = XML.write_data oc tag_artist album#artist in
@@ -2472,6 +2483,7 @@ let write_album_id oc album =
 let write_artist oc artist =
   XML.write_node oc tag_artist
     (fun oc ->
+       lwt () = XML.write_data oc tag_mlspot_cache_version (string_of_int artist_cache_version) in
        lwt () = XML.write_data oc tag_id (string_of_id artist#id) in
        lwt () = XML.write_data oc tag_name artist#name in
        lwt () = write_portrait oc artist#portrait in
@@ -2631,7 +2643,15 @@ let safe_parse name f =
 
 type fetch_kind = Cache | Fresh
 
-let rec browse session ids kind kind_id =
+let safe_unlink file =
+  try_lwt
+    Lwt_unix.unlink file
+  with Unix.Unix_error (error, _, _) ->
+    ignore (Lwt_log.error_f ~section "cannot remove %S: %s" file (Unix.error_message error));
+    return ()
+
+
+let rec browse session ids kind kind_id root cache_version =
   if List.exists (fun id -> id_length id <> 16) ids then raise (Wrong_id kind);
   lwt nodes =
     Lwt_list.map_p
@@ -2643,16 +2663,22 @@ let rec browse session ids kind kind_id =
            | Some (file, fd) ->
                try_lwt
                  lwt node = XML.parse_compressed_file_descr fd in
-                 return (Inl node)
+                 try
+                   let node = get_node root node in
+                   let cache_version' = int_of_string (get_data tag_mlspot_cache_version node) in
+                   if cache_version <> cache_version' then begin
+                     ignore (Lwt_log.warning_f ~section "the cache file %S does not match the version of mlspot, removing it" filename);
+                     lwt () = safe_unlink file in
+                     return (Inr id)
+                   end else
+                     return (Inl node)
+                 with _ ->
+                   ignore (Lwt_log.warning_f ~section "the cache file %S does not contains valid data, removing it" filename);
+                   lwt () = safe_unlink file in
+                   return (Inr id)
                with exn ->
                  ignore (Lwt_log.warning_f ~section ~exn "failed to read %S from the cache, removing it" filename);
-                 lwt () =
-                   try_lwt
-                     Lwt_unix.unlink file
-                   with Unix.Unix_error (error, _, _) ->
-                     ignore (Lwt_log.error_f ~section ~exn "cannot remove %S: %s" file (Unix.error_message error));
-                     return ()
-                 in
+                 lwt () = safe_unlink file in
                  return (Inr id)
                finally
                  Cache.release ();
@@ -2682,33 +2708,33 @@ let rec browse session ids kind kind_id =
 and get_artist session id =
   Weak_cache.find_lwt artists id
     (fun () ->
-       match_lwt browse session [id] "artist" 1 with
+       match_lwt browse session [id] "artist" 1 tag_artist artist_cache_version with
          | [(Fresh, node)] ->
              let artist = safe_parse "artist" (fun () -> make_artist (get_node tag_artist node)) in
              delay (save_artist session artist);
              return artist
          | [(Cache, node)] ->
-             safe_parse "artist" (fun () -> artist_from_cache (get_node tag_artist node) (get_album session))
+             safe_parse "artist" (fun () -> artist_from_cache node (get_album session))
          | _ ->
              assert false)
 
 and get_album session id =
   Weak_cache.find_lwt albums id
     (fun () ->
-       match_lwt browse session [id] "album" 2 with
+       match_lwt browse session [id] "album" 2 tag_album album_cache_version with
          | [(Fresh, node)] ->
              let album = safe_parse "album" (fun () -> make_album (get_node tag_album node)) in
              delay (save_album session album);
              return album
          | [(Cache, node)] ->
-             safe_parse "album" (fun () -> album_from_cache (get_node tag_album node) (get_tracks session))
+             safe_parse "album" (fun () -> album_from_cache node (get_tracks session))
          | _ ->
              assert false)
 
 and get_tracks session ids =
   Weak_cache.find_multiple_lwt tracks ids
     (fun ids ->
-       lwt nodes = browse session ids "track" 3 in
+       lwt nodes = browse session ids "track" 3 tag_track track_cache_version in
        return
          (List.flatten
             (List.map
@@ -2719,7 +2745,6 @@ and get_tracks session ids =
                      tracks
                  | (Cache, node) ->
                      [safe_parse "track" (fun () ->
-                                            let node = get_node tag_track node in
                                             let id = id_of_string (get_data tag_id node) in
                                             new track node id)])
               nodes)))

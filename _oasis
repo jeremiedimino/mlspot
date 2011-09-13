@@ -17,6 +17,14 @@ Description:
   access spotify services.
 
 # +-------------------------------------------------------------------+
+# | Flags                                                             |
+# +-------------------------------------------------------------------+
+
+Flag pulse
+  Default: false
+  Description: build examples using pulseaudio
+
+# +-------------------------------------------------------------------+
 # | The library                                                       |
 # +-------------------------------------------------------------------+
 
@@ -27,7 +35,7 @@ Library mlspot
   CSources: dns_stubs.c, shn.h, shn.c, shn_stubs.c, aes.c, aes.h, aes_stubs.c
   if !os_type(Win32)
     CCLib: -lresolv
-  BuildDepends: lwt.unix, lwt.syntax, lwt.syntax.log, cryptokit, expat, zip, react
+  BuildDepends: lwt.unix, lwt.syntax, lwt.syntax.log, cryptokit, expat, zip, react, ogg, vorbis
   XMETARequires: lwt.unix, cryptokit, expat, zip
   XMETADescription: Spotify client library
 
@@ -48,6 +56,14 @@ Executable search
   CompiledObject: best
   BuildDepends: mlspot, lwt.syntax
 
+Executable play
+  Path: examples/pulse
+  Install: false
+  Build$: flag(pulse)
+  MainIs: play.ml
+  CompiledObject: best
+  BuildDepends: mlspot, lwt.syntax, threads, lwt.preemptive, pulseaudio
+
 # +-------------------------------------------------------------------+
 # | Misc                                                              |
 # +-------------------------------------------------------------------+
@@ -56,4 +72,3 @@ SourceRepository head
   Type: darcs
   Location: http://darcs.ocamlcore.org/repos/mlspot
   Browser: http://darcs.ocamlcore.org/cgi-bin/darcsweb.cgi?r=mlspot;a=summary
-

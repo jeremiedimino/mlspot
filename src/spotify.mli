@@ -322,17 +322,33 @@ val search : session -> ?offset : int -> ?length : int -> string -> search_resul
 type stream
   (** Type of audio streams. *)
 
+exception Stream_closed
+  (** Exception raised when trying to use a closed stream. *)
 
+val open_track : session -> track_id : id -> file_id : id -> stream Lwt.t
+  (** [open_track session ~track_id ~file_id] opens the given track
+      and returns an audio stream for reading it. *)
 
-val open_track : session -> track_id : id -> file_id : id -> ?block_size : int -> ?prefetch_count : int -> unit -> string Lwt_stream.t Lwt.t
-  (** [fetch session ~track_id ~file_id ?block_size ?prefetch_count
-      ()] fetchs the given song from spotify.
+val channels : stream -> int
+  (** Returns the number of channel of the stream. *)
 
-      [track_id] must be of length 16 and [file_id] must be of length
-      20.
+val sample_rate : stream -> int
+  (** Returns the sample rate of the stream. *)
 
-      [block_size] is the size of blocks returned from the stream, it
-      must be a multiple of 4096 and defaults to
-      [4096]. [prefetch_count] is how much block mlspot should
-      prefetch before there are returned to the user. It default to
-      5. *)
+val read : stream -> float array array -> int -> int -> int Lwt.t
+  (** [read stream buffer offset length] reads up to [length] audio
+      frames from [stream] and stores them in [buffer] at
+      [offset]. [buffer] must be an array of dimmension the number of
+      channels of the stream.
+
+      It raises [End_of_file] on end of stream. *)
+
+val seek : stream -> float -> unit Lwt.t
+  (** [seek stream position] moves the current position in the
+      stream. [position] is given in seconds. *)
+
+val position : stream -> float
+  (** Return the current position in the stream. *)
+
+val close : stream -> unit Lwt.t
+  (** Closes the given stream. *)

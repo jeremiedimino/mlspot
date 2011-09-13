@@ -3112,7 +3112,7 @@ let search session ?(offset = 0) ?(length = 1000) query =
     return ()
 
 (* +-----------------------------------------------------------------+
-   | Fetching                                                        |
+   | Data fetching                                                   |
    +-----------------------------------------------------------------+ *)
 
 let request_key session track_id file_id =
@@ -3140,9 +3140,9 @@ let set_char str ofs chr =
   if ofs >= 0 && ofs < String.length str then
     String.unsafe_set str ofs chr
 
-let fetch_sub session file_id offset length aes iv =
+(* Fetch one part of a file from spotify. *)
+let fetch session file_id offset length aes iv =
   lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
-  Printf.printf "fetch (%d, %d)\n%!" offset length;
   try_lwt
     let packet = Packet.create () in
     Packet.add_int16 packet channel_id;
@@ -3172,7 +3172,7 @@ let fetch_sub session file_id offset length aes iv =
         set_char plain (block * 1024 + i * 4 + 3) (get_char data (block * 1024 + 3 * 256 + i))
       done;
 
-      (* Decrypt 1024 bytes block. This will fail for the last block. *)
+      (* Decrypt 1024 bytes block. *)
       for i = 0 to (block_size - 1) / 16 do
         (* Produce 16 bytes of keystream from the IV. *)
         rijndael_encrypt aes iv keystream;
@@ -3193,139 +3193,231 @@ let fetch_sub session file_id offset length aes iv =
         done
       done
     done;
-    if offset = 0 && len > 0 && plain.[5] = '\x06' then begin
-      let offset = ref 28 in
-      for i = 0 to Char.code plain.[26] - 1 do
-        offset := !offset + Char.code plain.[i + 27]
-      done;
-      return (String.sub plain !offset (len - !offset), len < length)
-    end else
-      return (plain, len < length)
+    return (plain, len < length)
   finally
     release_channel session#session_parameters channel_id;
     return ()
 
-let write_string file closed mutex fd str =
-  let rec loop ofs len =
-    lwt n = Lwt_unix.write fd str ofs len in
-    if n < len then
-      loop (ofs + n) (len - n)
-    else
-      return ()
-  in
-  try_lwt
-    if !closed then
-      return ()
-    else
-      Lwt_mutex.with_lock mutex (fun () -> loop 0 (String.length str))
-  with Unix.Unix_error (error, _, _) ->
-    closed := true;
-    ignore (Lwt_log.error_f ~section "failed to write to cache file %S: %s" file (Unix.error_message error));
-    lwt () = try_lwt Lwt_unix.close fd with _ -> return () in
-    safe_unlink file
+(* +-----------------------------------------------------------------+
+   | Streaming                                                       |
+   +-----------------------------------------------------------------+ *)
 
-let read_string fd len =
-  let buf = String.create len in
-  let rec loop ofs len =
-    match_lwt Lwt_unix.read fd buf ofs len with
-      | 0 ->
-          return (String.sub buf 0 ofs, true)
-      | n ->
-          if n < len then
-            loop (ofs + n) (len - n)
-          else
-            return (buf, false)
-  in
-  loop 0 len
+exception Stream_closed
 
-let create_stream fetch_sub cache close block_size prefetch_count =
-  let queue = Queue.create () in
-  let newdata = Lwt_condition.create () in
-  let consumed = Lwt_condition.create () in
-  let eoi = ref false in
-  let failure_waiter, failure_wakener = wait () in
-  let rec next () =
-    if Queue.is_empty queue then
-      if !eoi then
-        return None
+(* Ogg page streamer. *)
+class virtual page_stream = object(self)
+  method virtual skip_first_page : bool
+    (* Whether to skip the first page read. The first page from
+       spotify is always corrupted. *)
+
+  method virtual read : string -> int -> int -> unit Lwt.t
+    (* [read_bytes buf ofs len] reads exactly [len] bytes and store
+       them into [buf] at position [ofs]. *)
+
+  method virtual close : unit Lwt.t
+    (* Closes the source of the stream. *)
+
+  val mutable first = true
+    (* Has the first page been read ? *)
+
+  val page_buffer = String.create (27 + 255)
+    (* Buffer used to read one header. *)
+
+  (* Read one ogg page. *)
+  method get_page =
+    (* Read the part of the header of constant length. *)
+    lwt () = self#read page_buffer 0 27 in
+    (* Extract the number of segments. *)
+    let num_segments = Char.code page_buffer.[26] in
+    (* Create the buffer for the header. *)
+    let header = String.create (27 + num_segments) in
+    (* Copy the first part of the header. *)
+    String.unsafe_blit page_buffer 0 header 0 27;
+    (* Read segments. *)
+    lwt () = self#read header 27 num_segments in
+    (* Compute the length of the body. *)
+    let body_length = ref 0 in
+    for i = 0 to num_segments - 1 do
+      body_length := !body_length + Char.code header.[27 + i]
+    done;
+    (* Read the body of the page. *)
+    let body = String.create !body_length in
+    lwt () = self#read body 0 !body_length in
+    (* Skip the first page if needed. *)
+    if first then begin
+      first <- false;
+      if self#skip_first_page && header.[5] = '\x06' then
+        self#get_page
       else
-        lwt () = pick [failure_waiter; Lwt_condition.wait newdata] in
-        next ()
-    else begin
-      Lwt_condition.signal consumed ();
-      return (Some (Queue.take queue))
-    end
-  in
-  let rec loop offset =
-    if Queue.length queue >= prefetch_count then
-      lwt () = Lwt_condition.wait consumed in
-      loop offset
-    else begin
-      try_lwt
-        lwt data, finished = fetch_sub offset block_size in
-        delay (cache data);
-        Queue.push data queue;
-        Lwt_condition.signal newdata ();
-        if finished then begin
-          eoi := true;
-          delay (close ());
-          return ()
-        end else
-          loop (offset + block_size)
-      with exn ->
-        wakeup_exn failure_wakener exn;
-        return ()
-    end
-  in
-  ignore (loop 0);
-  Lwt_stream.from next
+        return (header, body)
+    end else
+      return (header, body)
+end
 
-let fetch_from_spotify session track_id file_id block_size prefetch_count file =
+type stream_parameters = {
+  page_stream : page_stream;
+  ogg_stream : Ogg.Stream.t;
+  decoder : Vorbis.Decoder.t;
+  close_waiter : unit Lwt.t;
+  close_wakener : unit Lwt.u;
+  channels : int;
+  sample_rate : int;
+}
+
+class stream parameters = object
+  val mutable parameters_opt = Some parameters
+  method parameters =
+    match parameters_opt with
+      | Some parameters -> parameters
+      | None -> raise Stream_closed
+  method parameters_opt = parameters
+  method close =
+    match parameters_opt with
+      | Some sp ->
+          parameters_opt <- None;
+          wakeup_exn sp.close_wakener Stream_closed;
+          sp.page_stream#close
+      | None ->
+          return ()
+end
+
+(* Read one packet from the given ogg stream. *)
+let rec get_packet ogg_stream page_stream =
+  try
+    return (Ogg.Stream.get_packet ogg_stream)
+  with Ogg.Not_enough_data ->
+    lwt page = page_stream#get_page in
+    Ogg.Stream.put_page ogg_stream page;
+    get_packet ogg_stream page_stream
+
+let create_stream page_stream =
+  try_lwt
+    lwt page = page_stream#get_page in
+    (* Read the serial of the stream. *)
+    let serial = Ogg.Page.serialno page in
+    (* Create the ogg stream. *)
+    let ogg_stream = Ogg.Stream.create ~serial () in
+    (* Feed it with the first page. *)
+    Ogg.Stream.put_page ogg_stream page;
+    (* Read the three first packets. *)
+    lwt packet1 = get_packet ogg_stream page_stream in
+    lwt packet2 = get_packet ogg_stream page_stream in
+    lwt packet3 = get_packet ogg_stream page_stream in
+    let decoder = Vorbis.Decoder.init packet1 packet2 packet3 in
+    let info = Vorbis.Decoder.info decoder in
+    let close_waiter, close_wakener = wait () in
+    return (new stream {
+              page_stream;
+              ogg_stream;
+              decoder;
+              close_waiter;
+              close_wakener;
+              channels = info.Vorbis.audio_channels;
+              sample_rate = info.Vorbis.audio_samplerate;
+            })
+  with exn ->
+    ignore (Lwt_log.error ~section ~exn "failed to create ogg vorbis stream");
+    raise (Error "failed to create vorbis stream")
+
+let rec read stream buffer offset length =
+  let sp = stream#parameters in
+  try
+    return (Vorbis.Decoder.decode_pcm sp.decoder sp.ogg_stream buffer offset length)
+  with Ogg.Not_enough_data ->
+    lwt page = pick [sp.page_stream#get_page; sp.close_waiter >> fail Exit] in
+    Ogg.Stream.put_page sp.ogg_stream page;
+    read stream buffer offset length
+
+let seek stream = assert false
+let position stream = assert false
+
+let channels stream = stream#parameters.channels
+let sample_rate stream = stream#parameters.sample_rate
+
+let close stream = stream#close
+
+(* +-----------------------------------------------------------------+
+   | Streaming from the disk                                         |
+   +-----------------------------------------------------------------+ *)
+
+class page_stream_from_fd fd = object
+  inherit page_stream
+
+  val ic = Lwt_io.of_fd ~mode:Lwt_io.input fd
+
+  method skip_first_page = false
+
+  method read buf ofs len =
+    Lwt_io.read_into_exactly ic buf ofs len
+
+  method close =
+    Lwt_io.close ic
+end
+
+(* +-----------------------------------------------------------------+
+   | Streaming from spotify                                          |
+   +-----------------------------------------------------------------+ *)
+
+class page_stream_from_spotify session file_id aes = object(self)
+  inherit page_stream
+
+  val iv = "\x72\xe0\x67\xfb\xdd\xcb\xcf\x77\xeb\xe8\xbc\x64\x3f\x63\x0d\x93"
+
+  val mutable global_offset = 0
+    (* Offset in the file. *)
+
+  val mutable buffer = ""
+    (* Data fetched from spotify. *)
+  val mutable offset = 0
+    (* Offset of the beginning of data not yet consumed in
+       [buffer]. *)
+  val mutable length = 0
+    (* Length of [buffer]. *)
+  val mutable end_of_stream = false
+    (* Whether the end of stream has been reached. *)
+
+  method skip_first_page = true
+
+  method read buf ofs len =
+    let avail = length - offset in
+    if avail >= len then begin
+      String.unsafe_blit buffer offset buf ofs len;
+      offset <- offset + len;
+      return ()
+    end else if end_of_stream then
+      raise_lwt End_of_file
+    else begin
+      String.unsafe_blit buffer offset buf ofs avail;
+      lwt data, finished = fetch session file_id global_offset 16384 aes iv in
+      end_of_stream <- finished;
+      offset <- 0;
+      buffer <- data;
+      length <- String.length buffer;
+      global_offset <- global_offset + length;
+      self#read buf (ofs + avail) (len - avail)
+    end
+
+  method close =
+    buffer <- "";
+    offset <- 0;
+    length <- 0;
+    return ()
+end
+
+let page_stream_from_spotify session track_id file_id =
   (* Tell spotify we are playing. *)
   lwt () = send_packet session#session_parameters CMD_REQUEST_PLAY "" in
   (* Request a new key. *)
   lwt aes = request_key session track_id file_id in
-  (* Create the stream. *)
-  let iv = "\x72\xe0\x67\xfb\xdd\xcb\xcf\x77\xeb\xe8\xbc\x64\x3f\x63\x0d\x93" in
-  (* Create the cache writer. *)
-  lwt cache, close =
-    match_lwt Cache.get_writer session ~overwrite:true (file ^ ".temp") with
-      | Some (file, fd) ->
-          let mutex = Lwt_mutex.create () in
-          let closed = ref false in
-          return
-            (write_string file closed mutex fd,
-             fun () ->
-               if !closed then
-                 return ()
-               else
-                 try_lwt
-                   lwt () = Lwt_unix.close fd in
-                   Lwt_unix.rename file (String.sub file 0 (String.length file - 5))
-                 with Unix.Unix_error (error, _, _) ->
-                   ignore (Lwt_log.error_f ~section "failed to save %S: %s" file (Unix.error_message error));
-                   return ())
-      | None ->
-          return ((fun str -> return ()), return)
-  in
-  return (create_stream (fun offset block_size -> fetch_sub session file_id offset block_size aes iv) cache close block_size prefetch_count)
+  (* Create the input object. *)
+  return (new page_stream_from_spotify session file_id aes)
 
-let fetch session ~track_id ~file_id ?(block_size = 4096) ?(prefetch_count = 5) () =
+(* +-----------------------------------------------------------------+
+   | Streaming                                                       |
+   +-----------------------------------------------------------------+ *)
+
+let open_track session ~track_id ~file_id =
   if id_length track_id <> 16 then raise (Wrong_id "track");
   if id_length file_id <> 20 then raise (Wrong_id "file");
-  if block_size < 0 || block_size mod 4096 <> 0 || prefetch_count < 0 then invalid_arg "Spotify.fetch";
-  let file = Filename.concat "tracks" (string_of_id file_id ^ ".ogg") in
-  if Cache.contains session file then
-    match_lwt Cache.get_reader session file with
-      | Some (file, fd) ->
-          let close () =
-            try_lwt
-              Lwt_unix.close fd
-            with Unix.Unix_error (error, _, _) ->
-              Lwt_log.error_f "cannot close %S: %s" file (Unix.error_message error)
-          in
-          return (create_stream (fun ofs len -> read_string fd len) (fun str -> return ()) close block_size prefetch_count)
-      | None ->
-          fetch_from_spotify session track_id file_id block_size prefetch_count file
-  else
-    fetch_from_spotify session track_id file_id block_size prefetch_count file
+  lwt page_stream = page_stream_from_spotify session track_id file_id in
+  create_stream page_stream

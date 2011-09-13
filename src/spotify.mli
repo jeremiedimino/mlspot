@@ -132,6 +132,17 @@ val uri_of_link : link -> string
 
 (** {6 Types} *)
 
+class type product = object
+  (** Note: there are many fields that can go here but i do not know
+      how to interpret them. If you need them, run your program with
+      the environment variable [MLSPOT_DEBUG_DIR] set to some
+      directory and look at the file with type ["products info"] (in
+      types). Then ask me for addition of these. *)
+
+  method product_type : string
+  method expiry : int option
+end
+
 class type portrait = object
   method id : id
   method link : link
@@ -268,6 +279,15 @@ class type search_result = object
   method albums : album_search list
   method tracks : track list
 end
+
+(** {6 Infomations}. *)
+
+val products : session -> product list React.signal
+  (** Product informations. *)
+
+val country_code : session -> string React.signal
+  (** The country code of the currently logged in user. This is
+      initially [""]. *)
 
 (** {6 Commands} *)
 

@@ -74,6 +74,38 @@ let split_space_coma str =
   in
   loop 0 0
 
+(* Ensure that a thread terminate before the end of the program. *)
+let delay thread =
+  if state thread = Sleep then begin
+    let node = Lwt_sequence.add_r (fun () -> thread) Lwt_main.exit_hooks in
+    ignore (
+      try_lwt
+        thread
+      finally
+        Lwt_sequence.remove node;
+        return ()
+    )
+  end
+
+let rec mkdir_p dir =
+  try_lwt
+    lwt () = Lwt_unix.access dir [Unix.F_OK] in
+    return true
+  with Unix.Unix_error _ ->
+    lwt ok = mkdir_p (Filename.dirname dir) in
+    if ok then
+      try_lwt
+        lwt () = Lwt_unix.mkdir dir 0o755 in
+        return true
+      with
+        | Unix.Unix_error (Unix.EEXIST, _, _) ->
+            return true
+        | Unix.Unix_error (error, _, _) ->
+            ignore (Lwt_log.error_f ~section "failed to make directory %S: %s" dir (Unix.error_message error));
+            return false
+    else
+      return false
+
 (* +-----------------------------------------------------------------+
    | Cache versions                                                  |
    +-----------------------------------------------------------------+ *)
@@ -662,25 +694,6 @@ module Cache = struct
     else
       return None
 
-  let rec mkdirp dir =
-    try_lwt
-      lwt () = Lwt_unix.access dir [Unix.F_OK] in
-      return true
-    with Unix.Unix_error _ ->
-      lwt ok = mkdirp (Filename.dirname dir) in
-      if ok then
-        try_lwt
-          lwt () = Lwt_unix.mkdir dir 0o755 in
-          return true
-        with
-          | Unix.Unix_error (Unix.EEXIST, _, _) ->
-              return true
-          | Unix.Unix_error (error, _, _) ->
-              ignore (Lwt_log.error_f ~section "failed to make directory %S: %s" dir (Unix.error_message error));
-              return false
-      else
-        return false
-
   let rec save session name data =
     if session#get_use_cache then
       let filename = Filename.concat session#get_cache_dir name in
@@ -688,7 +701,7 @@ module Cache = struct
         return ()
       else
         try_lwt
-          lwt ok = mkdirp (Filename.dirname filename) in
+          lwt ok = mkdir_p (Filename.dirname filename) in
           if ok then
             with_lock (fun () -> Lwt_io.with_file ~mode:Lwt_io.output filename (fun oc -> Lwt_io.write oc data))
           else
@@ -733,7 +746,7 @@ module Cache = struct
       else
         lwt () = acquire () in
         try_lwt
-          lwt ok = mkdirp (Filename.dirname filename) in
+          lwt ok = mkdir_p (Filename.dirname filename) in
           if ok then
             lwt fd = Lwt_unix.openfile filename [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o644 in
             return (Some (filename, fd))
@@ -756,6 +769,33 @@ end
    | Dispatching                                                     |
    +-----------------------------------------------------------------+ *)
 
+lwt dir_save_raw, debug =
+  match try Some (Sys.getenv "MLSPOT_DEBUG_DIR") with Not_found -> None with
+    | None ->
+        return (None, false)
+    | Some dir ->
+        lwt ok = mkdir_p dir in
+        lwt oc_types = Lwt_io.open_file ~mode:Lwt_io.output (Filename.concat dir "types")
+        and oc_log = Lwt_io.open_file ~mode:Lwt_io.output (Filename.concat dir "log") in
+        Lwt_log.add_rule "*" Lwt_log.Debug;
+        Lwt_log.default := Lwt_log.broadcast [
+          !Lwt_log.default;
+          Lwt_log.channel ~template:"$(date).$(milliseconds): $(loc-file), line $(loc-line): $(message)" ~close_mode:`Close ~channel:oc_log ();
+        ];
+        return (Some (dir, oc_types), true)
+
+let next_save_id = ref 0
+
+let save_raw_data kind str =
+  match dir_save_raw with
+    | Some (dir, oc) ->
+        let id = !next_save_id in
+        next_save_id := id + 1;
+        lwt () = Lwt_io.fprintlf oc "%08x: %s" id kind in
+        Lwt_io.with_file ~mode:Lwt_io.output (Filename.concat dir (Printf.sprintf "%08x" id)) (fun oc -> Lwt_io.write oc str)
+    | None ->
+        return ()
+
 let dispatch sp command payload =
   match command with
     | CMD_SECRET_BLOCK ->
@@ -766,6 +806,10 @@ let dispatch sp command payload =
 
     | CMD_WELCOME ->
         wakeup sp.login_wakener ();
+        return ()
+
+    | CMD_PROD_INFO ->
+        delay (save_raw_data "user info" payload);
         return ()
 
     | CMD_CHANNEL_DATA ->
@@ -801,8 +845,11 @@ let dispatch sp command payload =
                               let len = get_int16 res ofs in
                               let ofs = ofs + 2 in
                               if len = 0 then begin
+                                let data = String.sub res ofs (String.length res - ofs) in
+                                (* Save raw channel data for debugging. *)
+                                delay (save_raw_data "channel data" data);
                                 (* Send the result to the channel owner. *)
-                                wakeup channel.ch_wakener (String.sub res ofs (String.length res - ofs));
+                                wakeup channel.ch_wakener data;
                                 return ()
                               end else
                                 skip (ofs + len)
@@ -822,6 +869,7 @@ let dispatch sp command payload =
         else begin
           (* Read the channel id. *)
           let id = get_int16 payload 0 in
+          if debug then delay (save_raw_data "channel error" (String.sub payload 2 (String.length payload - 2)));
           match try Some (Channel_map.find id sp.channels) with Not_found -> None with
             | None ->
                 Lwt_log.error ~section "channel error from unknown channel received"
@@ -2801,19 +2849,6 @@ let save_artist session artist =
         in
         Lwt_list.iter_p (save_album session) artist#albums
 
-(* Ensure that a thread terminate before the end of the program. *)
-let delay thread =
-  if state thread = Sleep then begin
-    let node = Lwt_sequence.add_r (fun () -> thread) Lwt_main.exit_hooks in
-    ignore (
-      try_lwt
-        thread
-      finally
-        Lwt_sequence.remove node;
-        return ()
-    )
-  end
-
 (* +-----------------------------------------------------------------+
    | Commands                                                        |
    +-----------------------------------------------------------------+ *)
@@ -2833,7 +2868,6 @@ let safe_unlink file =
   with Unix.Unix_error (error, _, _) ->
     ignore (Lwt_log.error_f ~section "cannot remove %S: %s" file (Unix.error_message error));
     return ()
-
 
 let rec browse session ids kind kind_id root cache_version =
   if List.exists (fun id -> id_length id <> 16) ids then raise (Wrong_id kind);

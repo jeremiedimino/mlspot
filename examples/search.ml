@@ -21,6 +21,9 @@ lwt () =
   (* Connect to spotify. *)
   lwt () = Spotify.login session ~username:Sys.argv.(1) ~password:Sys.argv.(2) in
 
+  lwt stream = Spotify.fetch session ~track_id:(Spotify.id_of_string "41a8bfa7aff94d21bc1c24dba6375330") ~file_id:(Spotify.id_of_string "4fac45c10b552dc02add04f474f5a6e5f35e0cdd") ~block_size:(1 lsl 20) () in
+  lwt () = Lwt_stream.iter (fun _ -> print_endline "toto") stream in
+
   (* Perform the search. *)
   lwt search = Spotify.search session Sys.argv.(3) in
 

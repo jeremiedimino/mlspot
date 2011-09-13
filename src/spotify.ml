@@ -106,6 +106,13 @@ let rec mkdir_p dir =
     else
       return false
 
+let safe_unlink file =
+  try_lwt
+    Lwt_unix.unlink file
+  with Unix.Unix_error (error, _, _) ->
+    ignore (Lwt_log.error_f ~section "cannot remove %S: %s" file (Unix.error_message error));
+    return ()
+
 (* +-----------------------------------------------------------------+
    | Cache versions                                                  |
    +-----------------------------------------------------------------+ *)
@@ -141,6 +148,17 @@ external shn_maconly : shn_ctx -> string -> int -> int -> unit = "mlspot_shn_mac
 external shn_encrypt : shn_ctx -> string -> int -> int -> unit = "mlspot_shn_encrypt" "noalloc"
 external shn_decrypt : shn_ctx -> string -> int -> int -> unit = "mlspot_shn_decrypt" "noalloc"
 external shn_finish : shn_ctx -> string -> int -> int -> unit = "mlspot_shn_finish" "noalloc"
+
+(* +-----------------------------------------------------------------+
+   | AES                                                             |
+   +-----------------------------------------------------------------+ *)
+
+type aes_state
+
+external rijndael_key_setup_enc : string -> aes_state = "mlspot_aes_rijndael_key_setup_enc"
+external rijndael_key_setup_dec : string -> aes_state = "mlspot_aes_rijndael_key_setup_dec"
+external rijndael_encrypt : aes_state -> string -> string -> unit = "mlspot_aes_rijndael_encrypt"
+external rijndael_decrypt : aes_state -> string -> string -> unit = "mlspot_aes_rijndael_decrypt"
 
 (* +-----------------------------------------------------------------+
    | Service lookup                                                  |
@@ -914,11 +932,7 @@ module XML = struct
 
   let abort oc =
     lwt () = try_lwt Lwt_unix.close oc.fd with _ -> return () in
-    try_lwt
-      Lwt_unix.unlink oc.file
-    with Unix.Unix_error (error, _, _) ->
-      ignore (Lwt_log.error_f ~section "cannot unlink %S: %s" oc.file (Unix.error_message error));
-      return ()
+    safe_unlink oc.file
 
   let rec write_indent oc n =
     if n < oc.indent then
@@ -1447,10 +1461,10 @@ module Cache = struct
     else
       return None
 
-  let rec get_writer session name =
+  let rec get_writer session ?(overwrite = false) name =
     if session#get_use_cache then
       let filename = Filename.concat session#get_cache_dir name in
-      if Sys.file_exists filename then
+      if not overwrite && Sys.file_exists filename then
         return None
       else
         lwt () = acquire () in
@@ -1614,8 +1628,37 @@ let dispatch sp command payload =
         end
 
     | CMD_AES_KEY ->
-        (*let t = Cryptokit.Cipher.aes (String.sub payload 4 (String.length payload - 4)) Cryptokit.Cipher.Encrypt in*)
-        return ()
+        if String.length payload < 4 then
+          Lwt_log.error ~section "invalid AES key received"
+        else begin
+          let id = get_int16 payload 2 in
+          let key = String.sub payload 4 (String.length payload - 4) in
+          delay (save_raw_data "aes key" key);
+          match try Some (Channel_map.find id sp.channels) with Not_found -> None with
+            | None ->
+                Lwt_log.error ~section "AES key from unknown channel received"
+
+            | Some channel ->
+                release_channel sp id;
+                wakeup channel.ch_wakener key;
+                return ()
+        end
+
+    | CMD_AES_KEY_ERROR ->
+        if String.length payload < 4 then
+          Lwt_log.error ~section "invalid AES key error received"
+        else begin
+          let id = get_int16 payload 2 in
+          if debug then delay (save_raw_data "aes key error" (String.sub payload 4 (String.length payload - 4)));
+          match try Some (Channel_map.find id sp.channels) with Not_found -> None with
+            | None ->
+                Lwt_log.error ~section "AES key error from unknown channel received"
+
+            | Some channel ->
+                release_channel sp id;
+                wakeup_exn channel.ch_wakener (Error "key error");
+                return ()
+        end
 
     | _ ->
         Lwt_log.info_f ~section "do not know what to do with command '%s'" (string_of_command command)
@@ -2924,13 +2967,6 @@ let save_artist session artist =
 
 type fetch_kind = Cache | Fresh
 
-let safe_unlink file =
-  try_lwt
-    Lwt_unix.unlink file
-  with Unix.Unix_error (error, _, _) ->
-    ignore (Lwt_log.error_f ~section "cannot remove %S: %s" file (Unix.error_message error));
-    return ()
-
 let rec browse session ids kind kind_id root cache_version =
   if List.exists (fun id -> id_length id <> 16) ids then raise (Wrong_id kind);
   lwt nodes =
@@ -3075,28 +3111,221 @@ let search session ?(offset = 0) ?(length = 1000) query =
     release_channel session#session_parameters channel_id;
     return ()
 
-(*
-let fetch session track_id file_id =
-  if id_length track_id <> 16 || id_length file_id <> 20 then raise Invalid_id_length;
-  lwt () = send_packet session#get CMD_REQUEST_PLAY "" in
-  let packet = Packet.create () in
-  Packet.add_string packet file_id;
-  Packet.add_string packet track_id;
-  Packet.add_int16 packet 0;
-  Packet.add_int16 packet 0;
-  lwt () = send_packet session#get CMD_REQUEST_KEY (Packet.contents packet) in
-  lwt () = Lwt_unix.sleep 1. in
-  Packet.reset packet;
-  Packet.add_int16 packet 1;
-  Packet.add_int16 packet 0x0800;
-  Packet.add_int16 packet 0x0000;
-  Packet.add_int16 packet 0x0000;
-  Packet.add_int16 packet 0x0000;
-  Packet.add_int16 packet 0x4e20;
-  Packet.add_int32 packet (200 * 1000);
-  Packet.add_string packet file_id;
-  Packet.add_int32 packet 0;
-  Packet.add_int32 packet (100000 * 4096 / 4);
-  lwt () = send_packet session#get CMD_GET_DATA (Packet.contents packet) in
-  return ()
-*)
+(* +-----------------------------------------------------------------+
+   | Fetching                                                        |
+   +-----------------------------------------------------------------+ *)
+
+let request_key session track_id file_id =
+  lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
+  try_lwt
+    let packet = Packet.create () in
+    Packet.add_string packet (ID.to_bytes file_id);
+    Packet.add_string packet (ID.to_bytes track_id);
+    Packet.add_int16 packet 0;
+    Packet.add_int16 packet channel_id;
+    lwt () = send_packet session#session_parameters CMD_REQUEST_KEY (Packet.contents packet) in
+    lwt key = channel_waiter in
+    return (rijndael_key_setup_enc key)
+  finally
+    release_channel session#session_parameters channel_id;
+    return ()
+
+let get_char str ofs =
+  if ofs >= 0 && ofs < String.length str then
+    String.unsafe_get str ofs
+  else
+    '\x00'
+
+let set_char str ofs chr =
+  if ofs >= 0 && ofs < String.length str then
+    String.unsafe_set str ofs chr
+
+let fetch_sub session file_id offset length aes iv =
+  lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
+  Printf.printf "fetch (%d, %d)\n%!" offset length;
+  try_lwt
+    let packet = Packet.create () in
+    Packet.add_int16 packet channel_id;
+    Packet.add_int16 packet 0x0800;
+    Packet.add_int16 packet 0x0000;
+    Packet.add_int16 packet 0x0000;
+    Packet.add_int16 packet 0x0000;
+    Packet.add_int16 packet 0x4e20;
+    Packet.add_int32 packet (200 * 1000);
+    Packet.add_string packet (ID.to_bytes file_id);
+    Packet.add_int32 packet (offset / 4);
+    Packet.add_int32 packet ((offset + length) / 4);
+    lwt () = send_packet session#session_parameters CMD_GET_DATA (Packet.contents packet) in
+    lwt data = channel_waiter in
+    let len = String.length data in
+    let plain = String.create len in
+    let keystream = String.create 16 in
+    (* Decrypt each 1024 block. *)
+    for block = 0 to (len - 1) / 1024 do
+      let block_size = min 1024 (len - block * 1024) in
+
+      (* Deinterleave the 4x256 byte blocks *)
+      for i = 0 to (block_size - 1) / 4 do
+        set_char plain (block * 1024 + i * 4 + 0) (get_char data (block * 1024 + 0 * 256 + i));
+        set_char plain (block * 1024 + i * 4 + 1) (get_char data (block * 1024 + 1 * 256 + i));
+        set_char plain (block * 1024 + i * 4 + 2) (get_char data (block * 1024 + 2 * 256 + i));
+        set_char plain (block * 1024 + i * 4 + 3) (get_char data (block * 1024 + 3 * 256 + i))
+      done;
+
+      (* Decrypt 1024 bytes block. This will fail for the last block. *)
+      for i = 0 to (block_size - 1) / 16 do
+        (* Produce 16 bytes of keystream from the IV. *)
+        rijndael_encrypt aes iv keystream;
+
+        (* Update IV counter. *)
+        let rec loop i =
+          if i >= 0 then begin
+            let x = (Char.code iv.[i] + 1) land 0xff in
+            iv.[i] <- Char.unsafe_chr x;
+            if x = 0 then loop (i - 1)
+          end
+        in
+        loop 15;
+
+        (* Produce plaintext by XORing ciphertext with keystream. *)
+        for j = 0 to 15 do
+          set_char plain (block * 1024 + i * 16 + j) (Char.unsafe_chr ((Char.code (get_char plain (block * 1024 + i * 16 + j)) lxor (Char.code keystream.[j]))))
+        done
+      done
+    done;
+    if offset = 0 && len > 0 && plain.[5] = '\x06' then begin
+      let offset = ref 28 in
+      for i = 0 to Char.code plain.[26] - 1 do
+        offset := !offset + Char.code plain.[i + 27]
+      done;
+      return (String.sub plain !offset (len - !offset), len < length)
+    end else
+      return (plain, len < length)
+  finally
+    release_channel session#session_parameters channel_id;
+    return ()
+
+let write_string file closed mutex fd str =
+  let rec loop ofs len =
+    lwt n = Lwt_unix.write fd str ofs len in
+    if n < len then
+      loop (ofs + n) (len - n)
+    else
+      return ()
+  in
+  try_lwt
+    if !closed then
+      return ()
+    else
+      Lwt_mutex.with_lock mutex (fun () -> loop 0 (String.length str))
+  with Unix.Unix_error (error, _, _) ->
+    closed := true;
+    ignore (Lwt_log.error_f ~section "failed to write to cache file %S: %s" file (Unix.error_message error));
+    lwt () = try_lwt Lwt_unix.close fd with _ -> return () in
+    safe_unlink file
+
+let read_string fd len =
+  let buf = String.create len in
+  let rec loop ofs len =
+    match_lwt Lwt_unix.read fd buf ofs len with
+      | 0 ->
+          return (String.sub buf 0 ofs, true)
+      | n ->
+          if n < len then
+            loop (ofs + n) (len - n)
+          else
+            return (buf, false)
+  in
+  loop 0 len
+
+let create_stream fetch_sub cache close block_size prefetch_count =
+  let queue = Queue.create () in
+  let newdata = Lwt_condition.create () in
+  let consumed = Lwt_condition.create () in
+  let eoi = ref false in
+  let failure_waiter, failure_wakener = wait () in
+  let rec next () =
+    if Queue.is_empty queue then
+      if !eoi then
+        return None
+      else
+        lwt () = pick [failure_waiter; Lwt_condition.wait newdata] in
+        next ()
+    else begin
+      Lwt_condition.signal consumed ();
+      return (Some (Queue.take queue))
+    end
+  in
+  let rec loop offset =
+    if Queue.length queue >= prefetch_count then
+      lwt () = Lwt_condition.wait consumed in
+      loop offset
+    else begin
+      try_lwt
+        lwt data, finished = fetch_sub offset block_size in
+        delay (cache data);
+        Queue.push data queue;
+        Lwt_condition.signal newdata ();
+        if finished then begin
+          eoi := true;
+          delay (close ());
+          return ()
+        end else
+          loop (offset + block_size)
+      with exn ->
+        wakeup_exn failure_wakener exn;
+        return ()
+    end
+  in
+  ignore (loop 0);
+  Lwt_stream.from next
+
+let fetch_from_spotify session track_id file_id block_size prefetch_count file =
+  (* Tell spotify we are playing. *)
+  lwt () = send_packet session#session_parameters CMD_REQUEST_PLAY "" in
+  (* Request a new key. *)
+  lwt aes = request_key session track_id file_id in
+  (* Create the stream. *)
+  let iv = "\x72\xe0\x67\xfb\xdd\xcb\xcf\x77\xeb\xe8\xbc\x64\x3f\x63\x0d\x93" in
+  (* Create the cache writer. *)
+  lwt cache, close =
+    match_lwt Cache.get_writer session ~overwrite:true (file ^ ".temp") with
+      | Some (file, fd) ->
+          let mutex = Lwt_mutex.create () in
+          let closed = ref false in
+          return
+            (write_string file closed mutex fd,
+             fun () ->
+               if !closed then
+                 return ()
+               else
+                 try_lwt
+                   lwt () = Lwt_unix.close fd in
+                   Lwt_unix.rename file (String.sub file 0 (String.length file - 5))
+                 with Unix.Unix_error (error, _, _) ->
+                   ignore (Lwt_log.error_f ~section "failed to save %S: %s" file (Unix.error_message error));
+                   return ())
+      | None ->
+          return ((fun str -> return ()), return)
+  in
+  return (create_stream (fun offset block_size -> fetch_sub session file_id offset block_size aes iv) cache close block_size prefetch_count)
+
+let fetch session ~track_id ~file_id ?(block_size = 4096) ?(prefetch_count = 5) () =
+  if id_length track_id <> 16 then raise (Wrong_id "track");
+  if id_length file_id <> 20 then raise (Wrong_id "file");
+  if block_size < 0 || block_size mod 4096 <> 0 || prefetch_count < 0 then invalid_arg "Spotify.fetch";
+  let file = Filename.concat "tracks" (string_of_id file_id ^ ".ogg") in
+  if Cache.contains session file then
+    match_lwt Cache.get_reader session file with
+      | Some (file, fd) ->
+          let close () =
+            try_lwt
+              Lwt_unix.close fd
+            with Unix.Unix_error (error, _, _) ->
+              Lwt_log.error_f "cannot close %S: %s" file (Unix.error_message error)
+          in
+          return (create_stream (fun ofs len -> read_string fd len) (fun str -> return ()) close block_size prefetch_count)
+      | None ->
+          fetch_from_spotify session track_id file_id block_size prefetch_count file
+  else
+    fetch_from_spotify session track_id file_id block_size prefetch_count file

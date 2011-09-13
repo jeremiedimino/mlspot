@@ -316,3 +316,23 @@ val search : session -> ?offset : int -> ?length : int -> string -> search_resul
       search. [offset] represent the offset the first response to get
       in the list of all response. It default to [0]. [length] is the
       maximum number of responses to return. It default to [1000]. *)
+
+(** {6 Streams} *)
+
+type stream
+  (** Type of audio streams. *)
+
+
+
+val open_track : session -> track_id : id -> file_id : id -> ?block_size : int -> ?prefetch_count : int -> unit -> string Lwt_stream.t Lwt.t
+  (** [fetch session ~track_id ~file_id ?block_size ?prefetch_count
+      ()] fetchs the given song from spotify.
+
+      [track_id] must be of length 16 and [file_id] must be of length
+      20.
+
+      [block_size] is the size of blocks returned from the stream, it
+      must be a multiple of 4096 and defaults to
+      [4096]. [prefetch_count] is how much block mlspot should
+      prefetch before there are returned to the user. It default to
+      5. *)

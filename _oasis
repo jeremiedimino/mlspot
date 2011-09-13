@@ -24,7 +24,7 @@ Library mlspot
   Path: src
   Install: true
   Modules: Spotify
-  CSources: dns_stubs.c, shn.h, shn.c, shn_stubs.c
+  CSources: dns_stubs.c, shn.h, shn.c, shn_stubs.c, aes.c, aes.h, aes_stubs.c
   if !os_type(Win32)
     CCLib: -lresolv
   BuildDepends: lwt.unix, lwt.syntax, lwt.syntax.log, cryptokit, expat, zip, react

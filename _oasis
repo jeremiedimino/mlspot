@@ -40,6 +40,15 @@ Library mlspot
   XMETARequires: lwt.unix, cryptokit, expat, zip, react, ogg, vorbis
   XMETADescription: Spotify client library
 
+Library "mlspot-top"
+  Path: src
+  Install: true
+  Modules: Spotify_printers, Spotify_top
+  BuildDepends: mlspot
+  FindlibName: top
+  FindlibParent: mlspot
+  XMETADescription: printers for the toplevel
+
 Library "pa_xml"
   Install: false
   Path: syntax

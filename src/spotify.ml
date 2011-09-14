@@ -356,6 +356,234 @@ end = struct
 end
 
 (* +-----------------------------------------------------------------+
+   | Byte streams                                                    |
+   +-----------------------------------------------------------------+ *)
+
+(* Type of byte stream. *)
+class type byte_stream = object
+  method read : string -> int -> int -> int Lwt.t
+    (* [read buf ofs len] reads up to [len] bytes and store them into
+       [buf] at [ofs]. It returns the number of bytes actually
+       read. It returns [0] on end of stream.
+
+       Notes:
+       - all calls to read must be serialized
+       - it must raise only [Error] *)
+
+  method close : unit Lwt.t
+    (* Close the stream.
+
+       Note:
+       - there must be only one call to close, and it must be done after all
+       calls to [read]
+       - it must raise only [Error] *)
+end
+
+(* Read all data of the given stream. *)
+let string_of_stream stream =
+  let rec loop size data =
+    let buffer = String.create 4096 in
+    match_lwt stream#read buffer 0 4096 with
+      | 0 ->
+          lwt () = stream#close in
+          let res = String.create size in
+          let rec copy ofs data =
+            match data with
+              | [] ->
+                  return res
+              | (buf, len) :: data ->
+                  let ofs = ofs - len in
+                  String.blit buf 0 res ofs len;
+                  copy ofs data
+          in
+          copy size data
+      | n ->
+          loop (size + n) ((buffer, n) :: data)
+  in
+  loop 0 []
+
+(* Create a stream from a sub-string. *)
+class stream_of_string string init_offset init_length = object
+  val mutable offset = init_offset
+  val mutable length = init_length
+
+  method read buf ofs len =
+    let len = min len length in
+    String.blit string offset buf ofs len;
+    offset <- offset + len;
+    length <- length - len;
+    return len
+
+  method close =
+    return ()
+end
+
+(* Create a stream from a file descriptor. [file] is used for error
+   messages. *)
+class stream_of_file file fd = object
+  method read buf ofs len =
+    try_lwt
+      Lwt_unix.read fd buf ofs len
+    with Unix.Unix_error (error, _, _) ->
+      raise_lwt (Error (Printf.sprintf "cannot read from %S: %s" file (Unix.error_message error)))
+
+  method close =
+    try_lwt
+      Lwt_unix.close fd
+    with Unix.Unix_error (error, _, _) ->
+      raise_lwt (Error (Printf.sprintf "cannot close %S: %s" file (Unix.error_message error)))
+end
+
+type stream_state = BOS | BODY | EOS
+    (* State of stream:
+
+       - BOS = beginning of stream
+       - BODy = body of the stream
+       - EOS = end of stream *)
+
+class inflate_stream (stream : byte_stream) = object(self)
+  val buffer = String.create 4096
+    (* Buffer containing compressed data. *)
+
+  val mutable offset = 0
+    (* Offset of data not yet consumed in [buffer]. *)
+
+  val mutable length = 0
+    (* Length of data in [buffer]. *)
+
+  val z_stream = Zlib.inflate_init false
+    (* The Z stream. *)
+
+  val mutable size = 0l
+    (* Size of uncomressed data read so far. *)
+
+  val mutable crc = 0l
+    (* CRC of uncompressed data read so far. *)
+
+  val mutable state = BOS
+    (* State of the stream. *)
+
+  method private read_byte =
+    if length > 0 then begin
+      let byte = Char.code buffer.[offset] in
+      offset <- offset + 1;
+      length <- length - 1;
+      return byte
+    end else begin
+      match_lwt stream#read buffer 0 (String.length buffer) with
+        | 0 ->
+            raise_lwt (Error "invalid gzip file: premature end of data")
+        | n ->
+            offset <- 1;
+            length <- n - 1;
+            return (Char.code buffer.[0])
+    end
+
+  method private read_int32_little_endian =
+    lwt x0 = self#read_byte >|= Int32.of_int in
+    lwt x1 = self#read_byte >|= Int32.of_int in
+    lwt x2 = self#read_byte >|= Int32.of_int in
+    lwt x3 = self#read_byte >|= Int32.of_int in
+    return (Int32.logor x0 (Int32.logor (Int32.shift_left x1 8) (Int32.logor (Int32.shift_left x2 16) (Int32.shift_left x3 24))))
+
+  method private skip_string =
+    match_lwt self#read_byte with
+      | 0 -> return ()
+      | _ -> self#skip_string
+
+  method private read_header =
+    lwt id1 = self#read_byte in
+    lwt id2 = self#read_byte in
+    if id1 <> 0x1f || id2 <> 0x8b then raise (Error "invalid gzip file: bad magic number");
+    lwt cm = self#read_byte in
+    if cm <> 8 then raise (Error "invalid gzip file: unknown compression method");
+    lwt flags = self#read_byte in
+    if flags land 0xe0 <> 0 then raise (Error "invalid gzip file: bad flags");
+    lwt () = for_lwt i = 1 to 6 do self#read_byte >> return () done in
+    lwt () =
+      if flags land 0x04 <> 0 then begin
+        lwt len1 = self#read_byte in
+        lwt len2 = self#read_byte in
+        for_lwt i = 1 to len1 lor (len2 lsl 8) do
+          lwt _ = self#read_byte in
+          return ()
+        done
+      end else
+        return ()
+    in
+    lwt () =
+      if flags land 0x08 <> 0 then
+        self#skip_string
+      else
+        return ()
+    in
+    lwt () =
+      if flags land 0x10 <> 0 then
+        self#skip_string
+      else
+        return ()
+    in
+    if flags land 0x02 <> 0 then
+      lwt _ = self#read_byte in
+      lwt _ = self#read_byte in
+      return ()
+    else
+      return ()
+
+  method private check_data =
+    lwt crc' = self#read_int32_little_endian in
+    lwt size' = self#read_int32_little_endian in
+    if crc <> crc' then
+      raise_lwt (Error "invalid gzip file: CRC mismatch")
+    else if size <> size' then
+      raise_lwt (Error "invalid gzip file: size mismatch")
+    else
+      return ()
+
+  method read buf ofs len =
+    match state with
+      | BOS ->
+          lwt () = self#read_header in
+          state <- BODY;
+          self#read buf ofs len
+      | EOS ->
+          return 0
+      | BODY ->
+          if length > 0 then begin
+            let eos, len_src, len_dst =
+              try
+                Zlib.inflate z_stream buffer offset length buf ofs len Zlib.Z_SYNC_FLUSH
+              with Zlib.Error (func, message) ->
+                raise (Error (Printf.sprintf "invalid gzip file: %s" message))
+            in
+            offset <- offset + len_src;
+            length <- length - len_src;
+            size <- Int32.add size (Int32.of_int len_dst);
+            crc <- Zlib.update_crc crc buf ofs len_dst;
+            if eos then begin
+              Zlib.inflate_end z_stream;
+              state <- EOS;
+              lwt () = self#check_data in
+              return len_dst
+            end else if len_dst = 0 then
+              self#read buf ofs len
+            else
+              return len_dst
+          end else begin
+            match_lwt stream#read buffer 0 (String.length buffer) with
+              | 0 ->
+                  raise_lwt (Error "invalid gzip file: premature end of data")
+              | n ->
+                  offset <- 0;
+                  length <- n;
+                  self#read buf ofs len
+          end
+
+  method close =
+    stream#close
+end
+
+(* +-----------------------------------------------------------------+
    | XML                                                             |
    +-----------------------------------------------------------------+ *)
 
@@ -600,239 +828,33 @@ module XML = struct
 
   let buffer_size = 8192
 
-  module type Monad = sig
-    type 'a t
-    val bind : 'a t -> ('a -> 'b t) -> 'b t
-    val return : 'a -> 'a t
-  end
+  let parse_stream stream =
+    let xp, node = create_parser () in
+    let buffer = String.create 4096 in
+    let rec loop () =
+      match_lwt stream#read buffer 0 (String.length buffer) with
+        | 0 ->
+            Expat.final xp;
+            return node
+        | n ->
+            Expat.parse_sub xp buffer 0 n;
+            loop ()
+    in
+    try_lwt
+      loop ()
+    with Expat.Expat_error error ->
+      raise_lwt (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
+    finally
+      stream#close
 
-  module Make_gzip_header_reader (Lwt : Monad) = struct
-    open Lwt
-
-    let rec skip_string read_byte =
-      match_lwt read_byte () with
-        | 0 -> return ()
-        | _ -> skip_string read_byte
-
-    let read read_byte =
-      lwt id1 = read_byte () in
-      lwt id2 = read_byte () in
-      if id1 <> 0x1f || id2 <> 0x8b then raise (Error "invalid gzip file: bad magic number");
-      lwt cm = read_byte () in
-      if cm <> 8 then raise (Error "invalid gzip file: unknown compression method");
-      lwt flags = read_byte () in
-      if flags land 0xe0 <> 0 then raise (Error "invalid gzip file: bad flags");
-      lwt () = for_lwt i = 1 to 6 do read_byte () >> return () done in
-      lwt () =
-        if flags land 0x04 <> 0 then begin
-          lwt len1 = read_byte () in
-          lwt len2 = read_byte () in
-          for_lwt i = 1 to len1 lor (len2 lsl 8) do
-            lwt _ = read_byte () in
-            return ()
-          done
-        end else
-          return ()
-      in
-      lwt () =
-        if flags land 0x08 <> 0 then
-          skip_string read_byte
-        else
-          return ()
-      in
-      lwt () =
-        if flags land 0x10 <> 0 then
-          skip_string read_byte
-        else
-          return ()
-      in
-      if flags land 0x02 <> 0 then
-        lwt _ = read_byte () in
-        lwt _ = read_byte () in
-        return ()
-      else
-        return ()
-  end
-
-  module Gzip = Make_gzip_header_reader (struct
-                                           type 'a t = 'a
-                                           let bind x f = f x
-                                           let return x = x
-                                           let fail = raise
-                                         end)
-
-  module Lwt_gzip = Make_gzip_header_reader (Lwt)
-
-  let get_int32_little_endian str ofs =
-    if ofs < 0 || ofs + 4 > String.length str then raise (Error "invalid gzip file: premature end of file");
-    let x0 = Int32.of_int (Char.code (String.unsafe_get str (ofs + 0))) in
-    let x1 = Int32.of_int (Char.code (String.unsafe_get str (ofs + 1))) in
-    let x2 = Int32.of_int (Char.code (String.unsafe_get str (ofs + 2))) in
-    let x3 = Int32.of_int (Char.code (String.unsafe_get str (ofs + 3))) in
-    Int32.logor x0 (Int32.logor (Int32.shift_left x1 8) (Int32.logor (Int32.shift_left x2 16) (Int32.shift_left x3 24)))
-
-  let parse_string str =
+  let parse_string string =
     let xp, node = create_parser () in
     try
-      Expat.parse xp str;
+      Expat.parse xp string;
       Expat.final xp;
       node
     with Expat.Expat_error error ->
       raise (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
-
-  let parse_compressed_string str =
-    let xp, node = create_parser () in
-    let buffer = String.create buffer_size in
-    let stream = Zlib.inflate_init false in
-    try
-      let rec loop ofs size crc =
-        let eoi, len_src, len_dst = Zlib.inflate stream str ofs (String.length str - ofs) buffer 0 buffer_size Zlib.Z_NO_FLUSH in
-        let size = Int32.add size (Int32.of_int len_dst) in
-        let crc = Zlib.update_crc crc buffer 0 len_dst in
-        Expat.parse_sub xp buffer 0 len_dst;
-        if not eoi then
-          loop (ofs + len_src) size crc
-        else
-          (ofs + len_src, size, crc)
-      in
-      let ofs = ref 0 in
-      let read_byte () =
-        if !ofs >= String.length str then
-          raise (Error "invalid gzip file: prematire end of file")
-        else begin
-          let o = !ofs in
-          ofs := o + 1;
-          Char.code (String.unsafe_get str o)
-        end
-      in
-      Gzip.read read_byte;
-      let ofs, size, crc = loop !ofs Int32.zero Int32.zero in
-      Zlib.inflate_end stream;
-      let crc' = get_int32_little_endian str ofs in
-      let size' = get_int32_little_endian str (ofs + 4) in
-      if crc <> crc' then raise (Error "invalid gzip file: CRC mismatch");
-      if size <> size' then raise (Error "invalid gzip file: size mismatch");
-      Expat.final xp;
-      node
-    with
-      | Expat.Expat_error error ->
-          raise (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
-      | Zlib.Error (func, msg) ->
-          raise (Error ("invalid compressed data: " ^ msg))
-
-  let parse_file_descr file fd =
-    let xp, node = create_parser () in
-    let buffer = String.create buffer_size in
-    try_lwt
-      let rec loop () =
-        match_lwt Lwt_unix.read fd buffer 0 buffer_size with
-          | 0 ->
-              return ()
-          | n ->
-              Expat.parse_sub xp buffer 0 n;
-              loop ()
-      in
-      lwt () = loop () in
-      Expat.final xp;
-      return node
-    with
-      | Expat.Expat_error error ->
-          raise_lwt (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
-      | Unix.Unix_error (error, _, _) ->
-          raise_lwt (Error ("cannot read file: " ^ Unix.error_message error))
-    finally
-      safe_close file fd
-
-  let parse_compressed_file_descr file fd =
-    let xp, node = create_parser () in
-    let ibuffer = String.create buffer_size in
-    let obuffer = String.create buffer_size in
-    let stream = Zlib.inflate_init false in
-    try_lwt
-      let rec loop ofs size crc =
-        let ofs, size, crc =
-          if ofs > 0 then begin
-            let eoi, len_src, len_dst = Zlib.inflate stream ibuffer 0 ofs obuffer 0 buffer_size Zlib.Z_NO_FLUSH in
-            let size = Int32.add size (Int32.of_int len_dst) in
-            let crc = Zlib.update_crc crc obuffer 0 len_dst in
-            Expat.parse_sub xp obuffer 0 len_dst;
-            if len_src < ofs then begin
-              String.blit ibuffer len_src ibuffer 0 (ofs - len_src);
-              (ofs - len_src, size, crc)
-            end else
-              (0, size, crc)
-          end else
-            (0, size, crc)
-        in
-        match_lwt Lwt_unix.read fd ibuffer ofs (buffer_size - ofs) with
-          | 0 ->
-              let rec loop ofs' size crc =
-                let eoi, len_src, len_dst = Zlib.inflate stream ibuffer ofs' (ofs - ofs') obuffer 0 buffer_size Zlib.Z_NO_FLUSH in
-                let size = Int32.add size (Int32.of_int len_dst) in
-                let crc = Zlib.update_crc crc obuffer 0 len_dst in
-                Expat.parse_sub xp obuffer 0 len_dst;
-                if not eoi then
-                  loop (ofs' + len_src) size crc
-                else begin
-                  let rem = ofs - (ofs' + len_src) in
-                  if rem <> 0 then String.blit ibuffer (ofs' + len_src) ibuffer 0 rem;
-                  return (rem, size, crc)
-                end
-              in
-              loop 0 size crc
-          | n ->
-              let eoi, len_src, len_dst = Zlib.inflate stream ibuffer 0 (ofs + n) obuffer 0 buffer_size Zlib.Z_NO_FLUSH in
-              let size = Int32.add size (Int32.of_int len_dst) in
-              let crc = Zlib.update_crc crc obuffer 0 len_dst in
-              Expat.parse_sub xp obuffer 0 len_dst;
-              if len_src < ofs + n then begin
-                String.blit ibuffer len_src ibuffer 0 (ofs + n - len_src);
-                loop (ofs + n - len_src) size crc
-              end else
-                loop 0 size crc
-      in
-      let ofs = ref 0 and len = ref 0 in
-      let read_byte () =
-        if !ofs = !len then
-          match_lwt Lwt_unix.read fd ibuffer 0 buffer_size with
-            | 0 ->
-                raise_lwt (Error "invalid gzip file: premature end of file")
-            | n ->
-                ofs := 1;
-                len := n;
-                return (Char.code (String.unsafe_get ibuffer 0))
-    else begin
-      let o = !ofs in
-      ofs := o + 1;
-      return (Char.code (String.unsafe_get ibuffer o))
-    end
-  in
-  lwt () = Lwt_gzip.read read_byte in
-  if !ofs < !len then String.blit ibuffer !ofs ibuffer 0 (!len - !ofs);
-  lwt ofs, size, crc = loop (!len - !ofs) Int32.zero Int32.zero in
-  Zlib.inflate_end stream;
-  let rec refill8 ofs =
-    if ofs < 8 then
-      match_lwt Lwt_unix.read fd ibuffer ofs (8 - ofs) with
-        | 0 -> raise_lwt (Error "invalid gzip file: premature end of file")
-        | n -> refill8 (ofs + n)
-else
-  return ()
-in
-lwt () = refill8 ofs in
-let crc' = get_int32_little_endian ibuffer 0 in
-let size' = get_int32_little_endian ibuffer 4 in
-if crc <> crc' then raise (Error "invalid gzip file: CRC mismatch");
-if size <> size' then raise (Error "invalid gzip file: size mismatch");
-Expat.final xp;
-return node
-with
-  | Expat.Expat_error error ->
-      raise_lwt (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
-  | Unix.Unix_error (error, _, _) ->
-      raise_lwt (Error ("cannot read file: " ^ Unix.error_message error))
-finally
-  safe_close file fd
 
   type writer = {
     fd : Lwt_unix.file_descr;
@@ -1188,13 +1210,19 @@ let int_of_command = function
 
 module Channel_map = Map.Make (struct type t = int let compare a b = a - b end)
 
-(* Information about a channel. *)
 type channel = {
-  mutable ch_data : string list;
-  (* Data of the channel, in reverse order of reception. *)
+  ch_data : (string * int * int) Queue.t;
+  (* Queue of pending data. *)
 
-  ch_wakener : string Lwt.u;
-  (* Wakener for when the packet is terminated. *)
+  mutable ch_done : bool;
+  (* Whether the channel is terminated. *)
+
+  ch_cond : unit Lwt_condition.t;
+  (* Condition used to notify thread waiting for data. *)
+
+  ch_error_waiter : unit Lwt.t;
+  ch_error_wakener : unit Lwt.u;
+  (* Thread wakeup when an error occurs on the channel. *)
 }
 
 (* Parameters for online sessions. *)
@@ -1305,11 +1333,102 @@ let or_logout sp w =
    | Channels                                                        |
    +-----------------------------------------------------------------+ *)
 
+class steam_of_channel header channel = object(self)
+  val mutable state = if header then BOS else BODY
+
+  val mutable buffer = ""
+  val mutable offset = 0
+  val mutable length = 0
+
+  method private read_byte =
+    if length > 0 then begin
+      let byte = Char.code buffer.[offset] in
+      offset <- offset + 1;
+      length <- length - 1;
+      return byte
+    end else begin
+      match_lwt self#fetch with
+        | true ->
+            self#read_byte
+        | false ->
+            raise_lwt (Error "premature end of channel")
+    end
+
+  method private skip_bytes skip_len =
+    if skip_len < length then begin
+      offset <- offset + skip_len;
+      length <- length - skip_len;
+      return ()
+    end else begin
+      let skip_len = skip_len - length in
+      match_lwt self#fetch with
+        | true ->
+            self#skip_bytes skip_len
+        | false ->
+            raise_lwt (Error "premature end of channel")
+    end
+
+  method private read_int16 =
+    lwt x0 = self#read_byte in
+    lwt x1 = self#read_byte in
+    return ((x0 lsl 8) lor x1)
+
+  method private fetch =
+    if not (Queue.is_empty channel.ch_data) then begin
+      let buf, ofs, len = Queue.take channel.ch_data in
+      buffer <- buf;
+      offset <- ofs;
+      length <- len;
+      return true
+    end else if channel.ch_done then begin
+      state <- EOS;
+      return false
+    end else begin
+      lwt () = pick [channel.ch_error_waiter; Lwt_condition.wait channel.ch_cond] in
+      self#fetch
+    end
+
+  method private skip_headers =
+    lwt len = self#read_int16 in
+    if len = 0 then
+      return ()
+    else begin
+      lwt () = self#skip_bytes len in
+      self#skip_headers
+    end
+
+  method read buf ofs len =
+    match state with
+      | BOS ->
+          lwt () = self#skip_headers in
+          state <- BODY;
+          self#read buf ofs len
+      | EOS ->
+          return 0
+      | BODY ->
+          if length = 0 then
+            match_lwt self#fetch with
+              | true ->
+                  self#read buf ofs len
+              | false ->
+                  return 0
+          else begin
+            let len = min len length in
+            String.blit buffer offset buf ofs len;
+            offset <- offset + len;
+            length <- length - len;
+            return len
+          end
+
+  method close =
+    return ()
+end
+
 (* Allocate a channel. If all channel ID are taken, wait for one to be
    released. It returns the channel id, the packet of the channel and
    a thread which terminates when the packet is completely
    received. *)
-let alloc_channel sp =
+let alloc_channel ?(header = true) sp =
   let rec loop id =
     if Channel_map.mem id sp.channels then
       let id = (id + 1) land 0xffff in
@@ -1319,10 +1438,16 @@ let alloc_channel sp =
         loop id
     else begin
       sp.next_channel_id <- id + 1;
-      let packet = Packet.create () in
-      let waiter, wakener = task () in
-      sp.channels <- Channel_map.add id { ch_data = []; ch_wakener = wakener } sp.channels;
-      Some (id, packet, or_logout sp waiter)
+      let waiter, wakener = wait () in
+      let channel = {
+        ch_data = Queue.create ();
+        ch_cond = Lwt_condition.create ();
+        ch_done = false;
+        ch_error_waiter = or_logout sp waiter;
+        ch_error_wakener = wakener;
+      } in
+      sp.channels <- Channel_map.add id channel sp.channels;
+      Some (id, new steam_of_channel header channel)
     end;
   in
   let rec wait_for_id () =
@@ -1586,6 +1711,7 @@ let dispatch sp command payload =
         else begin
           (* Read the channel id. *)
           let id = get_int16 payload 0 in
+          delay (save_raw_data "channel data" payload);
           match try Some (Channel_map.find id sp.channels) with Not_found -> None with
             | None ->
                 Lwt_log.error ~section "channel data from unknown channel received"
@@ -1594,39 +1720,12 @@ let dispatch sp command payload =
                 if String.length payload = 2 then begin
                   (* End of channel. *)
                   release_channel sp id;
-                  (* Concatenates all data received. *)
-                  let len = List.fold_left (fun len str -> len + String.length str - 2) 0 channel.ch_data in
-                  let res = String.create len in
-                  let rec loop ofs data =
-                    match data with
-                      | str :: data ->
-                          let len = String.length str - 2 in
-                          String.unsafe_blit str 2 res (ofs - len) len;
-                          loop (ofs - len) data
-                      | [] ->
-                          (* Skip headers. *)
-                          let rec skip ofs =
-                            if ofs + 2 > String.length res then begin
-                              wakeup_exn channel.ch_wakener (Error "invalid data received");
-                              return ()
-                            end else
-                              let len = get_int16 res ofs in
-                              let ofs = ofs + 2 in
-                              if len = 0 then begin
-                                let data = String.sub res ofs (String.length res - ofs) in
-                                (* Save raw channel data for debugging. *)
-                                delay (save_raw_data "channel data" data);
-                                (* Send the result to the channel owner. *)
-                                wakeup channel.ch_wakener data;
-                                return ()
-                              end else
-                                skip (ofs + len)
-                          in
-                          skip 0
-                  in
-                  loop len channel.ch_data
+                  channel.ch_done <- true;
+                  Lwt_condition.signal channel.ch_cond ();
+                  return ()
                 end else begin
-                  channel.ch_data <- payload :: channel.ch_data;
+                  Queue.add (payload, 2, String.length payload - 2) channel.ch_data;
+                  Lwt_condition.signal channel.ch_cond ();
                   return ()
                 end
         end
@@ -1637,14 +1736,14 @@ let dispatch sp command payload =
         else begin
           (* Read the channel id. *)
           let id = get_int16 payload 0 in
-          if debug then delay (save_raw_data "channel error" (String.sub payload 2 (String.length payload - 2)));
+          delay (save_raw_data "channel error" payload);
           match try Some (Channel_map.find id sp.channels) with Not_found -> None with
             | None ->
                 Lwt_log.error ~section "channel error from unknown channel received"
 
             | Some channel ->
                 release_channel sp id;
-                wakeup_exn channel.ch_wakener (Error "channel error");
+                wakeup_exn channel.ch_error_wakener (Error "channel error");
                 return ()
         end
 
@@ -1653,15 +1752,16 @@ let dispatch sp command payload =
           Lwt_log.error ~section "invalid AES key received"
         else begin
           let id = get_int16 payload 2 in
-          let key = String.sub payload 4 (String.length payload - 4) in
-          delay (save_raw_data "aes key" key);
+          delay (save_raw_data "aes key" payload);
           match try Some (Channel_map.find id sp.channels) with Not_found -> None with
             | None ->
                 Lwt_log.error ~section "AES key from unknown channel received"
 
             | Some channel ->
                 release_channel sp id;
-                wakeup channel.ch_wakener key;
+                Queue.add (payload, 4, String.length payload - 4) channel.ch_data;
+                channel.ch_done <- true;
+                Lwt_condition.signal channel.ch_cond ();
                 return ()
         end
 
@@ -1670,14 +1770,14 @@ let dispatch sp command payload =
           Lwt_log.error ~section "invalid AES key error received"
         else begin
           let id = get_int16 payload 2 in
-          if debug then delay (save_raw_data "aes key error" (String.sub payload 4 (String.length payload - 4)));
+          delay (save_raw_data "aes key error" payload);
           match try Some (Channel_map.find id sp.channels) with Not_found -> None with
             | None ->
                 Lwt_log.error ~section "AES key error from unknown channel received"
 
             | Some channel ->
                 release_channel sp id;
-                wakeup_exn channel.ch_wakener (Error "key error");
+                wakeup_exn channel.ch_error_wakener (Error "key error");
                 return ()
         end
 
@@ -2999,7 +3099,7 @@ let rec browse session ids kind kind_id root cache_version =
                return (Inr id)
            | Some (file, fd) ->
                try_lwt
-                 lwt node = XML.parse_compressed_file_descr file fd in
+                 lwt node = XML.parse_stream (new inflate_stream (new stream_of_file file fd)) in
                  try
                    let node = get_node root node in
                    let cache_version' = int_of_string (get_data tag_mlspot_cache_version node) in
@@ -3027,19 +3127,15 @@ let rec browse session ids kind kind_id root cache_version =
        | Inl node ->
            return (Cache, node)
        | Inr id ->
-           lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
-           try_lwt
-             let packet = Packet.create () in
-             Packet.add_int16 packet channel_id;
-             Packet.add_int8 packet kind_id;
-             List.iter (fun id -> Packet.add_string packet (ID.to_bytes id)) ids;
-             if kind_id = 1 || kind_id = 2 then Packet.add_int32 packet 0;
-             lwt () = send_packet session#session_parameters CMD_BROWSE (Packet.contents packet) in
-             lwt data = channel_waiter in
-             return (Fresh, XML.parse_compressed_string data)
-           finally
-             release_channel session#session_parameters channel_id;
-             return ())
+           lwt channel_id, stream = alloc_channel session#session_parameters in
+           let packet = Packet.create () in
+           Packet.add_int16 packet channel_id;
+           Packet.add_int8 packet kind_id;
+           List.iter (fun id -> Packet.add_string packet (ID.to_bytes id)) ids;
+           if kind_id = 1 || kind_id = 2 then Packet.add_int32 packet 0;
+           lwt () = send_packet session#session_parameters CMD_BROWSE (Packet.contents packet) in
+           lwt node = XML.parse_stream (new inflate_stream stream) in
+           return (Fresh, node))
     nodes
 
 and get_artist session id =
@@ -3075,16 +3171,16 @@ and get_tracks session ids =
        return
          (List.flatten
             (List.map
-              (function
-                 | (Fresh, node) ->
-                     let tracks = safe_parse "track" (fun () -> List.map make_track (get_nodes tag_track (get_node tag_tracks (get_node tag_result node)))) in
-                     delay (Lwt_list.iter_s (save_track session) tracks);
-                     tracks
-                 | (Cache, node) ->
-                     [safe_parse "track" (fun () ->
-                                            let id = id_of_string (get_data tag_id node) in
-                                            new track node id)])
-              nodes)))
+               (function
+                  | (Fresh, node) ->
+                      let tracks = safe_parse "track" (fun () -> List.map make_track (get_nodes tag_track (get_node tag_tracks (get_node tag_result node)))) in
+                      delay (Lwt_list.iter_s (save_track session) tracks);
+                      tracks
+                  | (Cache, node) ->
+                      [safe_parse "track" (fun () ->
+                                             let id = id_of_string (get_data tag_id node) in
+                                             new track node id)])
+               nodes)))
 
 let get_track session id =
   lwt tracks = get_tracks session [id] in
@@ -3101,55 +3197,47 @@ let get_image session id =
          | Some data ->
              return data
          | None ->
-             lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
+             lwt channel_id, stream = alloc_channel session#session_parameters in
              try_lwt
                let packet = Packet.create () in
                Packet.add_int16 packet channel_id;
                Packet.add_string packet (ID.to_bytes id);
                lwt () = send_packet session#session_parameters CMD_IMAGE (Packet.contents packet) in
-               lwt data = channel_waiter in
+               lwt data = string_of_stream stream in
                delay (Cache.save session filename data);
                return data)
 
 let search session ?(offset = 0) ?(length = 1000) query =
   let len = String.length query in
   if len > 255 then invalid_arg "Spotify.search";
-  lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
-  try_lwt
-    let packet = Packet.create () in
-    Packet.add_int16 packet channel_id;
-    Packet.add_int32 packet offset;
-    Packet.add_int32 packet length;
-    Packet.add_int16 packet 0;
-    Packet.add_int8 packet len;
-    Packet.add_string packet query;
-    lwt () = send_packet session#session_parameters CMD_SEARCH (Packet.contents packet) in
-    lwt data = channel_waiter in
-    let search = safe_parse "search result" (fun () -> new search_result query (get_node tag_result (XML.parse_compressed_string data))) in
-    delay (Lwt_list.iter_p (save_track session) search#tracks);
-    return search
-  finally
-    release_channel session#session_parameters channel_id;
-    return ()
+  lwt channel_id, stream = alloc_channel session#session_parameters in
+  let packet = Packet.create () in
+  Packet.add_int16 packet channel_id;
+  Packet.add_int32 packet offset;
+  Packet.add_int32 packet length;
+  Packet.add_int16 packet 0;
+  Packet.add_int8 packet len;
+  Packet.add_string packet query;
+  lwt () = send_packet session#session_parameters CMD_SEARCH (Packet.contents packet) in
+  lwt node = XML.parse_stream (new inflate_stream stream) in
+  let search = safe_parse "search result" (fun () -> new search_result query (get_node tag_result node)) in
+  delay (Lwt_list.iter_p (save_track session) search#tracks);
+  return search
 
 (* +-----------------------------------------------------------------+
    | Data fetching                                                   |
    +-----------------------------------------------------------------+ *)
 
 let request_key session track_id file_id =
-  lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
-  try_lwt
-    let packet = Packet.create () in
-    Packet.add_string packet (ID.to_bytes file_id);
-    Packet.add_string packet (ID.to_bytes track_id);
-    Packet.add_int16 packet 0;
-    Packet.add_int16 packet channel_id;
-    lwt () = send_packet session#session_parameters CMD_REQUEST_KEY (Packet.contents packet) in
-    lwt key = channel_waiter in
-    return (rijndael_key_setup_enc key)
-  finally
-    release_channel session#session_parameters channel_id;
-    return ()
+  lwt channel_id, stream = alloc_channel ~header:false session#session_parameters in
+  let packet = Packet.create () in
+  Packet.add_string packet (ID.to_bytes file_id);
+  Packet.add_string packet (ID.to_bytes track_id);
+  Packet.add_int16 packet 0;
+  Packet.add_int16 packet channel_id;
+  lwt () = send_packet session#session_parameters CMD_REQUEST_KEY (Packet.contents packet) in
+  lwt key = string_of_stream stream in
+  return (rijndael_key_setup_enc key)
 
 let get_char str ofs =
   if ofs >= 0 && ofs < String.length str then
@@ -3163,61 +3251,57 @@ let set_char str ofs chr =
 
 (* Fetch one part of a file from spotify. *)
 let fetch session file_id offset length aes iv =
-  lwt channel_id, channel_packet, channel_waiter = alloc_channel session#session_parameters in
-  try_lwt
-    let packet = Packet.create () in
-    Packet.add_int16 packet channel_id;
-    Packet.add_int16 packet 0x0800;
-    Packet.add_int16 packet 0x0000;
-    Packet.add_int16 packet 0x0000;
-    Packet.add_int16 packet 0x0000;
-    Packet.add_int16 packet 0x4e20;
-    Packet.add_int32 packet (200 * 1000);
-    Packet.add_string packet (ID.to_bytes file_id);
-    Packet.add_int32 packet (offset / 4);
-    Packet.add_int32 packet ((offset + length) / 4);
-    lwt () = send_packet session#session_parameters CMD_GET_DATA (Packet.contents packet) in
-    lwt data = channel_waiter in
-    let len = String.length data in
-    let plain = String.create len in
-    let keystream = String.create 16 in
-    (* Decrypt each 1024 block. *)
-    for block = 0 to (len - 1) / 1024 do
-      let block_size = min 1024 (len - block * 1024) in
+  lwt channel_id, stream = alloc_channel session#session_parameters in
+  let packet = Packet.create () in
+  Packet.add_int16 packet channel_id;
+  Packet.add_int16 packet 0x0800;
+  Packet.add_int16 packet 0x0000;
+  Packet.add_int16 packet 0x0000;
+  Packet.add_int16 packet 0x0000;
+  Packet.add_int16 packet 0x4e20;
+  Packet.add_int32 packet (200 * 1000);
+  Packet.add_string packet (ID.to_bytes file_id);
+  Packet.add_int32 packet (offset / 4);
+  Packet.add_int32 packet ((offset + length) / 4);
+  lwt () = send_packet session#session_parameters CMD_GET_DATA (Packet.contents packet) in
+  lwt data = string_of_stream stream in
+  let len = String.length data in
+  let plain = String.create len in
+  let keystream = String.create 16 in
+  (* Decrypt each 1024 block. *)
+  for block = 0 to (len - 1) / 1024 do
+    let block_size = min 1024 (len - block * 1024) in
 
-      (* Deinterleave the 4x256 byte blocks *)
-      for i = 0 to (block_size - 1) / 4 do
-        set_char plain (block * 1024 + i * 4 + 0) (get_char data (block * 1024 + 0 * 256 + i));
-        set_char plain (block * 1024 + i * 4 + 1) (get_char data (block * 1024 + 1 * 256 + i));
-        set_char plain (block * 1024 + i * 4 + 2) (get_char data (block * 1024 + 2 * 256 + i));
-        set_char plain (block * 1024 + i * 4 + 3) (get_char data (block * 1024 + 3 * 256 + i))
-      done;
-
-      (* Decrypt 1024 bytes block. *)
-      for i = 0 to (block_size - 1) / 16 do
-        (* Produce 16 bytes of keystream from the IV. *)
-        rijndael_encrypt aes iv keystream;
-
-        (* Update IV counter. *)
-        let rec loop i =
-          if i >= 0 then begin
-            let x = (Char.code iv.[i] + 1) land 0xff in
-            iv.[i] <- Char.unsafe_chr x;
-            if x = 0 then loop (i - 1)
-          end
-        in
-        loop 15;
-
-        (* Produce plaintext by XORing ciphertext with keystream. *)
-        for j = 0 to 15 do
-          set_char plain (block * 1024 + i * 16 + j) (Char.unsafe_chr ((Char.code (get_char plain (block * 1024 + i * 16 + j)) lxor (Char.code keystream.[j]))))
-        done
-      done
+    (* Deinterleave the 4x256 byte blocks *)
+    for i = 0 to (block_size - 1) / 4 do
+      set_char plain (block * 1024 + i * 4 + 0) (get_char data (block * 1024 + 0 * 256 + i));
+      set_char plain (block * 1024 + i * 4 + 1) (get_char data (block * 1024 + 1 * 256 + i));
+      set_char plain (block * 1024 + i * 4 + 2) (get_char data (block * 1024 + 2 * 256 + i));
+      set_char plain (block * 1024 + i * 4 + 3) (get_char data (block * 1024 + 3 * 256 + i))
     done;
-    return plain
-  finally
-    release_channel session#session_parameters channel_id;
-    return ()
+
+    (* Decrypt 1024 bytes block. *)
+    for i = 0 to (block_size - 1) / 16 do
+      (* Produce 16 bytes of keystream from the IV. *)
+      rijndael_encrypt aes iv keystream;
+
+      (* Update IV counter. *)
+      let rec loop i =
+        if i >= 0 then begin
+          let x = (Char.code iv.[i] + 1) land 0xff in
+          iv.[i] <- Char.unsafe_chr x;
+          if x = 0 then loop (i - 1)
+        end
+      in
+      loop 15;
+
+      (* Produce plaintext by XORing ciphertext with keystream. *)
+      for j = 0 to 15 do
+        set_char plain (block * 1024 + i * 16 + j) (Char.unsafe_chr ((Char.code (get_char plain (block * 1024 + i * 16 + j)) lxor (Char.code keystream.[j]))))
+      done
+    done
+  done;
+  return plain
 
 (* +-----------------------------------------------------------------+
    | Streaming                                                       |

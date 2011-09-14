@@ -113,6 +113,13 @@ let safe_unlink file =
     ignore (Lwt_log.error_f ~section "cannot remove %S: %s" file (Unix.error_message error));
     return ()
 
+let safe_close file fd =
+  try_lwt
+    Lwt_unix.close fd
+  with Unix.Unix_error (error, _, _) ->
+    ignore (Lwt_log.error_f ~section "cannot close %S: %s" file (Unix.error_message error));
+    return ()
+
 (* +-----------------------------------------------------------------+
    | Cache versions                                                  |
    +-----------------------------------------------------------------+ *)
@@ -713,7 +720,7 @@ module XML = struct
       | Zlib.Error (func, msg) ->
           raise (Error ("invalid compressed data: " ^ msg))
 
-  let parse_file_descr fd =
+  let parse_file_descr file fd =
     let xp, node = create_parser () in
     let buffer = String.create buffer_size in
     try_lwt
@@ -734,9 +741,9 @@ module XML = struct
       | Unix.Unix_error (error, _, _) ->
           raise_lwt (Error ("cannot read file: " ^ Unix.error_message error))
     finally
-      Lwt_unix.close fd
+      safe_close file fd
 
-  let parse_compressed_file_descr fd =
+  let parse_compressed_file_descr file fd =
     let xp, node = create_parser () in
     let ibuffer = String.create buffer_size in
     let obuffer = String.create buffer_size in
@@ -811,7 +818,7 @@ module XML = struct
       | Unix.Unix_error (error, _, _) ->
           raise_lwt (Error ("cannot read file: " ^ Unix.error_message error))
     finally
-      Lwt_unix.close fd
+      safe_close file fd
 
   type writer = {
     fd : Lwt_unix.file_descr;
@@ -928,10 +935,10 @@ module XML = struct
     (* Flush the buffer. *)
     lwt () = write_exactly oc.fd oc.obuffer 0 (oc.oofs + 8) in
     (* Close the file. *)
-    Lwt_unix.close oc.fd
+    safe_close oc.file oc.fd
 
   let abort oc =
-    lwt () = try_lwt Lwt_unix.close oc.fd with _ -> return () in
+    lwt () = safe_close oc.file oc.fd in
     safe_unlink oc.file
 
   let rec write_indent oc n =
@@ -2978,7 +2985,7 @@ let rec browse session ids kind kind_id root cache_version =
                return (Inr id)
            | Some (file, fd) ->
                try_lwt
-                 lwt node = XML.parse_compressed_file_descr fd in
+                 lwt node = XML.parse_compressed_file_descr file fd in
                  try
                    let node = get_node root node in
                    let cache_version' = int_of_string (get_data tag_mlspot_cache_version node) in
@@ -3193,7 +3200,7 @@ let fetch session file_id offset length aes iv =
         done
       done
     done;
-    return (plain, len < length)
+    return plain
   finally
     release_channel session#session_parameters channel_id;
     return ()
@@ -3206,10 +3213,6 @@ exception Stream_closed
 
 (* Ogg page streamer. *)
 class virtual page_stream = object(self)
-  method virtual skip_first_page : bool
-    (* Whether to skip the first page read. The first page from
-       spotify is always corrupted. *)
-
   method virtual read : string -> int -> int -> unit Lwt.t
     (* [read_bytes buf ofs len] reads exactly [len] bytes and store
        them into [buf] at position [ofs]. *)
@@ -3246,7 +3249,7 @@ class virtual page_stream = object(self)
     (* Skip the first page if needed. *)
     if first then begin
       first <- false;
-      if self#skip_first_page && header.[5] = '\x06' then
+      if header.[5] = '\x06' then
         self#get_page
       else
         return (header, body)
@@ -3317,7 +3320,7 @@ let create_stream page_stream =
             })
   with exn ->
     ignore (Lwt_log.error ~section ~exn "failed to create ogg vorbis stream");
-    raise (Error "failed to create vorbis stream")
+    raise_lwt (Error "failed to create vorbis stream")
 
 let rec read stream buffer offset length =
   let sp = stream#parameters in
@@ -3345,8 +3348,6 @@ class page_stream_from_fd fd = object
 
   val ic = Lwt_io.of_fd ~mode:Lwt_io.input fd
 
-  method skip_first_page = false
-
   method read buf ofs len =
     Lwt_io.read_into_exactly ic buf ofs len
 
@@ -3357,6 +3358,9 @@ end
 (* +-----------------------------------------------------------------+
    | Streaming from spotify                                          |
    +-----------------------------------------------------------------+ *)
+
+let block_size = 16384
+  (* Size of blocks fetched from spotify. *)
 
 class page_stream_from_spotify session file_id aes = object(self)
   inherit page_stream
@@ -3376,7 +3380,8 @@ class page_stream_from_spotify session file_id aes = object(self)
   val mutable end_of_stream = false
     (* Whether the end of stream has been reached. *)
 
-  method skip_first_page = true
+  method fetch offset =
+    fetch session file_id offset block_size aes iv
 
   method read buf ofs len =
     let avail = length - offset in
@@ -3388,8 +3393,8 @@ class page_stream_from_spotify session file_id aes = object(self)
       raise_lwt End_of_file
     else begin
       String.unsafe_blit buffer offset buf ofs avail;
-      lwt data, finished = fetch session file_id global_offset 16384 aes iv in
-      end_of_stream <- finished;
+      lwt data = self#fetch global_offset in
+      if String.length data < block_size then end_of_stream <- true;
       offset <- 0;
       buffer <- data;
       length <- String.length buffer;
@@ -3404,13 +3409,195 @@ class page_stream_from_spotify session file_id aes = object(self)
     return ()
 end
 
-let page_stream_from_spotify session track_id file_id =
+module Int_set = Set.Make (struct type t = int let compare a b = a - b end)
+module Int_map = Map.Make (struct type t = int let compare a b = a - b end)
+
+let write_string fd str =
+  let rec loop ofs len =
+    lwt n = Lwt_unix.write fd str ofs len in
+    if n < len then
+      loop (ofs + n) (len - n)
+    else
+      return ()
+  in
+  loop 0 (String.length str)
+
+let read_string fd len =
+  let str = String.create len in
+  let rec loop ofs len =
+    lwt n = Lwt_unix.read fd str ofs len in
+    if n = 0 then
+      return (String.sub str 0 ofs)
+    else if n < len then
+      loop (ofs + n) (len - n)
+    else
+      return str
+  in
+  loop 0 len
+
+class page_stream_from_spotify_with_cache session file_id aes file rfd wfd = object(self)
+  inherit page_stream_from_spotify session file_id aes as super
+
+  val mutable cached = Int_set.empty
+    (* Set of blocks cached. *)
+
+  val mutable skipped = Int_map.empty
+    (* Map from offset of blocks skipped by the cache filler to their
+       length. *)
+
+  val mutable r_offset = 0
+    (* Offset in [rfd]. *)
+
+  val mutable w_offset = 0
+    (* Offset in [wfd]. *)
+
+  val mutable next_wanted = None
+    (* The next offset wanted by fetch. *)
+
+  val data_received = Lwt_condition.create ()
+    (* Condition signaled when the cache as [next_wanted] is filled. *)
+
+  val mutable closed = false
+    (* Whether the stream has been closed. *)
+
+  (* Seek in the input of the cache. *)
+  method seek_in offset =
+    if offset <> r_offset  then
+      try_lwt
+        lwt pos = Lwt_unix.lseek rfd offset Unix.SEEK_SET in
+        if pos <> offset then
+          raise_lwt (Error "cannot seek in cache")
+        else begin
+          r_offset <- offset;
+          return ()
+        end
+      with Unix.Unix_error (error, _, _) ->
+        ignore (Lwt_log.error_f ~section "cannot seek in %S: %s" file (Unix.error_message error));
+        raise_lwt (Error "cannot seek in cache")
+    else
+      return ()
+
+  method seek_out offset =
+    if offset <> w_offset  then
+      try_lwt
+        lwt pos = Lwt_unix.lseek wfd offset Unix.SEEK_SET in
+        if pos <> offset then
+          raise_lwt (Error "cannot seek in cache")
+        else begin
+          w_offset <- offset;
+          return ()
+        end
+      with Unix.Unix_error (error, _, _) ->
+        ignore (Lwt_log.error_f ~section "cannot seek in %S: %s" file (Unix.error_message error));
+        raise_lwt (Error "cannot seek in cache")
+    else
+      return ()
+
+  method close_out =
+    lwt () = Lwt_unix.close wfd in
+    try_lwt
+      Lwt_unix.rename file (Filename.chop_extension file)
+    with Unix.Unix_error (error, _, _) ->
+      ignore (Lwt_log.error_f ~section "cannot rename %S to %S: %s" file (Filename.chop_extension file) (Unix.error_message error));
+      return ()
+
+  method fill_cache offset length =
+    if closed then
+      Lwt_unix.close wfd
+    else
+      let offset =
+        match next_wanted with
+          | Some offset' ->
+              if offset' <> offset then begin
+                ignore (Lwt_log.error ~section "arg");
+                assert false
+              end else
+                offset
+          | None ->
+              offset
+      in
+      lwt () = self#seek_out offset in
+      (* Fetch data from spotify at offset. *)
+      lwt data = super#fetch offset in
+      (* Write them to the cache. *)
+      lwt () = write_string wfd data in
+      w_offset <- w_offset + String.length data;
+      (* Mark the block as cached. *)
+      cached <- Int_set.add offset cached;
+      (* Notify the fetcher. *)
+      (match next_wanted with
+         | Some _ ->
+             next_wanted <- None;
+             Lwt_condition.signal data_received ()
+         | None ->
+             ());
+      if String.length data < block_size then
+        (* End of file reached, try to filling missing part if there
+           are some. *)
+        match try Some (Int_map.min_binding skipped) with Not_found -> None with
+          | Some (offset, length) ->
+              skipped <- Int_map.remove offset skipped;
+              self#fill_cache offset length
+          | None ->
+              self#close_out
+      else if offset + block_size >= length then
+        (* We have reached the zone of missing data, try filling
+           missing part if there are some. *)
+        match try Some (Int_map.min_binding skipped) with Not_found -> None with
+          | Some (offset, length) ->
+              skipped <- Int_map.remove offset skipped;
+              self#fill_cache offset length
+          | None ->
+              self#close_out
+      else
+        self#fill_cache (offset + block_size) (length - block_size)
+
+  method fetch offset =
+    lwt () =
+      if Int_set.mem offset cached then
+        (* Data are already cached, do nothing. *)
+        return ()
+      else begin
+        (* Wait for data to be cached. *)
+        next_wanted <- Some offset;
+        Lwt_condition.wait data_received
+      end
+    in
+    lwt () = self#seek_in offset in
+    (* Read data from the cache. *)
+    lwt data = read_string rfd block_size in
+    r_offset <- r_offset + String.length data;
+    return data
+
+  method close =
+    closed <- true;
+    lwt () = super#close in
+    Lwt_unix.close rfd
+
+  initializer
+    ignore (self#fill_cache 0 max_int)
+end
+
+let page_stream_from_spotify session track_id file_id cache_file =
   (* Tell spotify we are playing. *)
   lwt () = send_packet session#session_parameters CMD_REQUEST_PLAY "" in
   (* Request a new key. *)
   lwt aes = request_key session track_id file_id in
-  (* Create the input object. *)
-  return (new page_stream_from_spotify session file_id aes)
+  (* Try to open the cache. *)
+  match_lwt Cache.get_writer session ~overwrite:true (cache_file ^ ".temp") with
+    | Some (file, wfd) -> begin
+        (* Do not lock the cache for streaming. *)
+        Cache.release ();
+        try_lwt
+          (* Also open the cache file for reading. *)
+          lwt rfd = Lwt_unix.openfile file [Unix.O_RDONLY] 0 in
+          return (new page_stream_from_spotify_with_cache session file_id aes file rfd wfd :> page_stream)
+        with Unix.Unix_error (error, _, _) ->
+          ignore (Lwt_log.error_f ~section "cannot open %S for reading: %s" file (Unix.error_message error));
+          return (new page_stream_from_spotify session file_id aes :> page_stream)
+      end
+    | None ->
+        return (new page_stream_from_spotify session file_id aes :> page_stream)
 
 (* +-----------------------------------------------------------------+
    | Streaming                                                       |
@@ -3419,5 +3606,12 @@ let page_stream_from_spotify session track_id file_id =
 let open_track session ~track_id ~file_id =
   if id_length track_id <> 16 then raise (Wrong_id "track");
   if id_length file_id <> 20 then raise (Wrong_id "file");
-  lwt page_stream = page_stream_from_spotify session track_id file_id in
-  create_stream page_stream
+  let cache_file = Filename.concat "tracks" (string_of_id file_id ^ ".ogg") in
+  match_lwt Cache.get_reader session cache_file with
+    | Some (file, fd) ->
+        (* Do not lock the cache for streaming. *)
+        Cache.release ();
+        create_stream (new page_stream_from_fd fd)
+    | None ->
+        lwt page_stream = page_stream_from_spotify session track_id file_id cache_file in
+        create_stream page_stream

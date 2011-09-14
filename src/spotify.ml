@@ -750,6 +750,20 @@ module XML = struct
     let stream = Zlib.inflate_init false in
     try_lwt
       let rec loop ofs size crc =
+        let ofs, size, crc =
+          if ofs > 0 then begin
+            let eoi, len_src, len_dst = Zlib.inflate stream ibuffer 0 ofs obuffer 0 buffer_size Zlib.Z_NO_FLUSH in
+            let size = Int32.add size (Int32.of_int len_dst) in
+            let crc = Zlib.update_crc crc obuffer 0 len_dst in
+            Expat.parse_sub xp obuffer 0 len_dst;
+            if len_src < ofs then begin
+              String.blit ibuffer len_src ibuffer 0 (ofs - len_src);
+              (ofs - len_src, size, crc)
+            end else
+              (0, size, crc)
+          end else
+            (0, size, crc)
+        in
         match_lwt Lwt_unix.read fd ibuffer ofs (buffer_size - ofs) with
           | 0 ->
               let rec loop ofs' size crc =
@@ -771,9 +785,9 @@ module XML = struct
               let size = Int32.add size (Int32.of_int len_dst) in
               let crc = Zlib.update_crc crc obuffer 0 len_dst in
               Expat.parse_sub xp obuffer 0 len_dst;
-              if len_src < n then begin
-                String.blit ibuffer len_src ibuffer 0 (n - len_src);
-                loop (n - len_src) size crc
+              if len_src < ofs + n then begin
+                String.blit ibuffer len_src ibuffer 0 (ofs + n - len_src);
+                loop (ofs + n - len_src) size crc
               end else
                 loop 0 size crc
       in
@@ -787,38 +801,38 @@ module XML = struct
                 ofs := 1;
                 len := n;
                 return (Char.code (String.unsafe_get ibuffer 0))
-        else begin
-          let o = !ofs in
-          ofs := o + 1;
-          return (Char.code (String.unsafe_get ibuffer o))
-        end
-      in
-      lwt () = Lwt_gzip.read read_byte in
-      if !ofs < !len then String.blit ibuffer !ofs ibuffer 0 (!len - !ofs);
-      lwt ofs, size, crc = loop (!len - !ofs) Int32.zero Int32.zero in
-      Zlib.inflate_end stream;
-      let rec refill8 ofs =
-        if ofs < 8 then
-          match_lwt Lwt_unix.read fd ibuffer ofs (8 - ofs) with
-            | 0 -> raise_lwt (Error "invalid gzip file: premature end of file")
-            | n -> refill8 (ofs + n)
-        else
-          return ()
-      in
-      lwt () = refill8 ofs in
-      let crc' = get_int32_little_endian ibuffer 0 in
-      let size' = get_int32_little_endian ibuffer 4 in
-      if crc <> crc' then raise (Error "invalid gzip file: CRC mismatch");
-      if size <> size' then raise (Error "invalid gzip file: size mismatch");
-      Expat.final xp;
-      return node
-    with
-      | Expat.Expat_error error ->
-          raise_lwt (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
-      | Unix.Unix_error (error, _, _) ->
-          raise_lwt (Error ("cannot read file: " ^ Unix.error_message error))
-    finally
-      safe_close file fd
+    else begin
+      let o = !ofs in
+      ofs := o + 1;
+      return (Char.code (String.unsafe_get ibuffer o))
+    end
+  in
+  lwt () = Lwt_gzip.read read_byte in
+  if !ofs < !len then String.blit ibuffer !ofs ibuffer 0 (!len - !ofs);
+  lwt ofs, size, crc = loop (!len - !ofs) Int32.zero Int32.zero in
+  Zlib.inflate_end stream;
+  let rec refill8 ofs =
+    if ofs < 8 then
+      match_lwt Lwt_unix.read fd ibuffer ofs (8 - ofs) with
+        | 0 -> raise_lwt (Error "invalid gzip file: premature end of file")
+        | n -> refill8 (ofs + n)
+else
+  return ()
+in
+lwt () = refill8 ofs in
+let crc' = get_int32_little_endian ibuffer 0 in
+let size' = get_int32_little_endian ibuffer 4 in
+if crc <> crc' then raise (Error "invalid gzip file: CRC mismatch");
+if size <> size' then raise (Error "invalid gzip file: size mismatch");
+Expat.final xp;
+return node
+with
+  | Expat.Expat_error error ->
+      raise_lwt (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
+  | Unix.Unix_error (error, _, _) ->
+      raise_lwt (Error ("cannot read file: " ^ Unix.error_message error))
+finally
+  safe_close file fd
 
   type writer = {
     fd : Lwt_unix.file_descr;

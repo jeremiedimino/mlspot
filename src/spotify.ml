@@ -2595,7 +2595,7 @@ class track_common node (id : id) = object
   val artists = get_datas tag_artist node
   val artists_id = List.map id_of_string (get_datas tag_artist_id node)
   val number = int_of_string (get_data tag_track_number node)
-  val length = float (int_of_string (get_data tag_length node)) /. 1000.
+  val length = try float (int_of_string (get_data tag_length node)) /. 1000. with Not_found -> 0.
   val files = List.map make_file (get_nodes tag_file (get_node tag_files node))
   val popularity = float_of_string (get_data tag_popularity node)
   val external_ids = List.map (fun node -> make_external_id node) (get_nodes tag_external_id (get_node tag_external_ids node))
@@ -2620,7 +2620,7 @@ class track node (id : id) = object
   val album_id = id_of_string (get_data tag_album_id node)
   val album_artist = get_data tag_album_artist node
   val album_artist_id = id_of_string (get_data tag_album_artist_id node)
-  val cover = id_of_string (get_data tag_cover node)
+  val cover = try Some (id_of_string (get_data tag_cover node)) with Not_found -> None
   val year = int_of_string (get_data tag_year node)
   method album = album
   method album_id = album_id
@@ -2635,7 +2635,7 @@ type album_temp = {
   at_id : id;
   at_artist : string;
   at_artist_id : id;
-  at_cover : id;
+  at_cover : id option;
   at_year : int;
 }
 
@@ -2665,7 +2665,7 @@ let write_track oc track =
        lwt () = XML.write_data oc tag_track_number (string_of_int track#number) in
        lwt () = XML.write_data oc tag_length (string_of_int (int_of_float (track#length *. 1000.))) in
        lwt () = XML.write_nodes oc tag_files write_file track#files in
-       lwt () = XML.write_data oc tag_cover (string_of_id track#cover) in
+       lwt () = match track#cover with Some id -> XML.write_data oc tag_cover (string_of_id id) | None -> return () in
        lwt () = XML.write_data oc tag_year (string_of_int track#year) in
        lwt () = XML.write_data oc tag_popularity (string_of_float track#popularity) in
        lwt () = XML.write_nodes oc tag_external_ids write_external_id track#external_ids in
@@ -2718,7 +2718,7 @@ let album_temp node id = {
   at_id = id;
   at_artist = get_data tag_artist node;
   at_artist_id = id_of_string (get_data tag_artist_id node);
-  at_cover = id_of_string (get_data tag_cover node);
+  at_cover = (try Some (id_of_string (get_data tag_cover node)) with Not_found -> None);
   at_year = int_of_string (get_data tag_year node);
 }
 
@@ -2781,7 +2781,7 @@ let write_album oc album =
        lwt () = XML.write_data oc tag_artist_id (string_of_id album#artist_id) in
        lwt () = XML.write_data oc tag_album_type album#album_type in
        lwt () = XML.write_data oc tag_year (string_of_int album#year) in
-       lwt () = XML.write_data oc tag_cover (string_of_id album#cover) in
+       lwt () = match album#cover with Some id -> XML.write_data oc tag_cover (string_of_id id) | None -> return () in
        lwt () = XML.write_nodes oc tag_copyright write_copyright album#copyrights in
        lwt () = XML.write_nodes oc tag_restrictions write_restriction album#restrictions in
        lwt () = XML.write_nodes oc tag_external_ids write_external_id album#external_ids in
@@ -2871,7 +2871,7 @@ class album_search node (id : id) = object
   val name = get_data tag_name node
   val artist = get_data tag_artist_name node
   val artist_id = id_of_string (get_data tag_artist_id node)
-  val cover = id_of_string (get_data tag_cover node)
+  val cover = try Some (id_of_string (get_data tag_cover node)) with Not_found -> None
   val popularity = float_of_string (get_data tag_popularity node)
   val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
   val external_ids = try List.map (fun node -> make_external_id node) (get_nodes tag_external_id (get_node tag_external_ids node)) with Not_found -> []
@@ -3263,8 +3263,7 @@ type stream_parameters = {
   decoder : Vorbis.Decoder.t;
   close_waiter : unit Lwt.t;
   close_wakener : unit Lwt.u;
-  channels : int;
-  sample_rate : int;
+  vorbis_info : Vorbis.info;
 }
 
 class stream parameters = object
@@ -3315,8 +3314,7 @@ let create_stream page_stream =
               decoder;
               close_waiter;
               close_wakener;
-              channels = info.Vorbis.audio_channels;
-              sample_rate = info.Vorbis.audio_samplerate;
+              vorbis_info = info;
             })
   with exn ->
     ignore (Lwt_log.error ~section ~exn "failed to create ogg vorbis stream");
@@ -3334,8 +3332,9 @@ let rec read stream buffer offset length =
 let seek stream = assert false
 let position stream = assert false
 
-let channels stream = stream#parameters.channels
-let sample_rate stream = stream#parameters.sample_rate
+let channels stream = stream#parameters.vorbis_info.Vorbis.audio_channels
+let sample_rate stream = stream#parameters.vorbis_info.Vorbis.audio_samplerate
+let vorbis_info stream = stream#parameters.vorbis_info
 
 let close stream = stream#close
 

@@ -199,7 +199,7 @@ class type track = object
   method number : int
   method length : float
   method files : file list
-  method cover : id
+  method cover : id option
   method popularity : float
   method external_ids : (string * string) list
   method alternatives : alternative list
@@ -219,7 +219,7 @@ class type album = object
   method artist_id : id
   method album_type : string
   method year : int
-  method cover : id
+  method cover : id option
   method copyrights : (string * string) list
   method restrictions : restriction list
   method external_ids : (string * string) list
@@ -253,7 +253,7 @@ class type album_search = object
   method name : string
   method artist : string
   method artist_id : id
-  method cover : id
+  method cover : id option
   method popularity : float
   method restrictions : restriction list
   method external_ids : (string * string) list
@@ -334,6 +334,9 @@ val channels : stream -> int
 
 val sample_rate : stream -> int
   (** Returns the sample rate of the stream. *)
+
+val vorbis_info : stream -> Vorbis.info
+  (** Returns all vorbis information of the file. *)
 
 val read : stream -> float array array -> int -> int -> int Lwt.t
   (** [read stream buffer offset length] reads up to [length] audio

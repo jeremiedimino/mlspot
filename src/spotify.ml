@@ -2635,7 +2635,7 @@ class track node (id : id) = object
   val album_artist = get_data tag_album_artist node
   val album_artist_id = id_of_string (get_data tag_album_artist_id node)
   val cover = try Some (id_of_string (get_data tag_cover node)) with Not_found -> None
-  val year = int_of_string (get_data tag_year node)
+  val year = try int_of_string (get_data tag_year node) with Not_found -> 0
   method album = album
   method album_id = album_id
   method album_artist = album_artist
@@ -2733,7 +2733,7 @@ let album_temp node id = {
   at_artist = get_data tag_artist node;
   at_artist_id = id_of_string (get_data tag_artist_id node);
   at_cover = (try Some (id_of_string (get_data tag_cover node)) with Not_found -> None);
-  at_year = int_of_string (get_data tag_year node);
+  at_year = (try int_of_string (get_data tag_year node) with Not_found -> 0);
 }
 
 class album_common node at (id : id) = object

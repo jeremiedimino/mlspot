@@ -36,7 +36,7 @@ Library mlspot
   CSources: dns_stubs.c, shn.h, shn.c, shn_stubs.c, aes.c, aes.h, aes_stubs.c
   if !os_type(Win32)
     CCLib: -lresolv
-  BuildDepends: lwt.unix, lwt.syntax, lwt.syntax.log, cryptokit, expat, zip, react, ogg, vorbis
+  BuildDepends: lwt.unix, lwt.syntax, lwt.syntax.log, cryptokit, expat, zip, lwt.react, ogg, vorbis
   XMETARequires: lwt.unix, cryptokit, expat, zip, react, ogg, vorbis
   XMETADescription: Spotify client library
 

@@ -8,6 +8,7 @@
  *)
 
 open Lwt
+open Lwt_react
 
 let section = Lwt_log.Section.make "spotify"
 
@@ -60,6 +61,34 @@ let split sep str =
         loop i (j + 1)
   in
   loop 0 0
+
+let strip str =
+  let rec loop a =
+    if a = String.length str then
+      a
+    else
+      match str.[a] with
+        | ' ' | '\n' | '\t' ->
+            loop (a + 1)
+        | _ ->
+            a
+  in
+  let a = loop 0 in
+  let rec loop b =
+    if b = a then
+      b
+    else
+      match str.[b - 1] with
+        | ' ' | '\n' | '\t' ->
+            loop (b - 1)
+        | _ ->
+            b
+  in
+  let b = loop (String.length str) in
+  if a = 0 && b = String.length str then
+    str
+  else
+    String.sub str a (b - a)
 
 let split_space_coma str =
   let rec loop i j =
@@ -119,6 +148,33 @@ let safe_close file fd =
   with Unix.Unix_error (error, _, _) ->
     ignore (Lwt_log.error_f ~section "cannot close %S: %s" file (Unix.error_message error));
     return ()
+
+lwt dir_save_raw, debug =
+  match try Some (Sys.getenv "MLSPOT_DEBUG_DIR") with Not_found -> None with
+    | None ->
+        return (None, false)
+    | Some dir ->
+        lwt ok = mkdir_p dir in
+        lwt oc_types = Lwt_io.open_file ~mode:Lwt_io.output (Filename.concat dir "types")
+        and oc_log = Lwt_io.open_file ~mode:Lwt_io.output (Filename.concat dir "log") in
+        Lwt_log.add_rule "*" Lwt_log.Debug;
+        Lwt_log.default := Lwt_log.broadcast [
+          !Lwt_log.default;
+          Lwt_log.channel ~template:"$(date).$(milliseconds): $(loc-file), line $(loc-line): $(message)" ~close_mode:`Close ~channel:oc_log ();
+        ];
+        return (Some (dir, oc_types), true)
+
+let next_save_id = ref 0
+
+let save_raw_data kind str =
+  match dir_save_raw with
+    | Some (dir, oc) ->
+        let id = !next_save_id in
+        next_save_id := id + 1;
+        lwt () = Lwt_io.fprintlf oc "%08x: %s" id kind in
+        Lwt_io.with_file ~mode:Lwt_io.output (Filename.concat dir (Printf.sprintf "%08x" id)) (fun oc -> Lwt_io.write oc str)
+    | None ->
+        return ()
 
 (* +-----------------------------------------------------------------+
    | Cache versions                                                  |
@@ -677,6 +733,8 @@ module XML = struct
       | [] ->
           ""
       | [str] ->
+          dm.data_length <- 0;
+          dm.data_chunks <- [];
           str
       | _ ->
           let res = String.create dm.data_length in
@@ -730,12 +788,14 @@ module XML = struct
 
   let buffer_size = 8192
 
-  let parse_stream cell root_handler stream =
+  let parse_stream ?(buggy_root = false) cell root_handler stream =
+    let root_handler = if buggy_root then new node "root" (fun attrs -> root_handler) else root_handler in
     let xp = create_parser root_handler in
     let buffer = String.create 4096 in
     let rec loop () =
       match_lwt stream#read buffer 0 (String.length buffer) with
         | 0 ->
+            if buggy_root then Expat.parse xp "</root>";
             Expat.final xp;
             root_handler#stop;
             return (match !cell with
@@ -746,16 +806,20 @@ module XML = struct
             loop ()
     in
     try_lwt
+      if buggy_root then Expat.parse xp "<root>";
       loop ()
     with Expat.Expat_error error ->
       raise_lwt (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
     finally
       stream#close
 
-  let parse_string cell root_handler string =
+  let parse_string ?(buggy_root = false) cell root_handler string =
+    let root_handler = if buggy_root then new node "root" (fun attrs -> root_handler) else root_handler in
     let xp = create_parser root_handler in
     try
+      if buggy_root then Expat.parse xp "<root>";
       Expat.parse xp string;
+      if buggy_root then Expat.parse xp "</root>";
       Expat.final xp;
       root_handler#stop;
       match !cell with
@@ -1021,6 +1085,656 @@ class products_parser assign =
     (fun attrs -> new nodes "product" (fun attrs assign -> new product_parser assign) assign)
 
 (* +-----------------------------------------------------------------+
+   | IDs                                                             |
+   +-----------------------------------------------------------------+ *)
+
+exception Id_parse_failure
+exception Wrong_id of string
+
+module ID : sig
+  type t
+    (* Note: ID are comparable using (==). *)
+
+  val length : t -> int
+  val hash : t -> int
+
+  val of_string : string -> t
+  val to_string : t -> string
+
+  val to_bytes : t -> string
+    (* Warning: the result must not be modified. *)
+
+  val of_bytes : string -> t
+    (* Warning: the string must not be modified. *)
+end = struct
+
+  type t = {
+    bytes : string;
+    hash : int;
+  }
+
+  type id = t
+
+  module IDs = Weak.Make (struct
+                            type t = id
+                            let equal id1 id2 = id1.bytes = id2.bytes
+                            let hash id = id.hash
+                          end)
+
+  (* Weak table of all encountered ids. *)
+  let ids = IDs.create 16384
+
+  let length id = String.length id.bytes
+  let hash id = id.hash
+
+  let to_bytes id = id.bytes
+  let of_bytes bytes = IDs.merge ids { bytes; hash = Hashtbl.hash bytes }
+
+  let int_of_hexa = function
+    | '0' .. '9' as ch -> Char.code ch - Char.code '0'
+    | 'a' .. 'f' as ch -> Char.code ch - Char.code 'a' + 10
+    | 'A' .. 'F' as ch -> Char.code ch - Char.code 'A' + 10
+    | _ -> raise Id_parse_failure
+
+  let of_string str =
+    let len = String.length str in
+    if len land 1 <> 0 then raise Id_parse_failure;
+    let bytes = String.create (len / 2) in
+    for i = 0 to len / 2 - 1 do
+      let x0 = int_of_hexa (String.unsafe_get str (i * 2 + 0)) in
+      let x1 = int_of_hexa (String.unsafe_get str (i * 2 + 1)) in
+      String.unsafe_set bytes i (Char.unsafe_chr ((x0 lsl 4) lor x1))
+    done;
+    of_bytes bytes
+
+  let hexa_of_int n =
+    if n < 10 then
+      Char.unsafe_chr (Char.code '0' + n)
+    else
+      Char.unsafe_chr (Char.code 'a' + n - 10)
+
+  let to_string id =
+    let len = String.length id.bytes in
+    let str = String.create (len * 2) in
+    for i = 0 to len - 1 do
+      let x = Char.code (String.unsafe_get id.bytes i) in
+      String.unsafe_set str (i * 2 + 0) (hexa_of_int (x lsr 4));
+      String.unsafe_set str (i * 2 + 1) (hexa_of_int (x land 15))
+    done;
+    str
+end
+
+type id = ID.t
+let id_length = ID.length
+let id_hash = ID.hash
+let id_of_string = ID.of_string
+let string_of_id = ID.to_string
+
+module ID_table = Hashtbl.Make (struct
+                                  type t = id
+                                  let equal = ( == )
+                                  let hash = id_hash
+                                end)
+
+(* +-----------------------------------------------------------------+
+   | Links                                                           |
+   +-----------------------------------------------------------------+ *)
+
+type uri = string
+
+let base62_alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+let base62_of_code x = base62_alphabet.[x]
+
+let code_of_base62 = function
+  | '0' -> 0
+  | '1' -> 1
+  | '2' -> 2
+  | '3' -> 3
+  | '4' -> 4
+  | '5' -> 5
+  | '6' -> 6
+  | '7' -> 7
+  | '8' -> 8
+  | '9' -> 9
+  | 'a' -> 10
+  | 'b' -> 11
+  | 'c' -> 12
+  | 'd' -> 13
+  | 'e' -> 14
+  | 'f' -> 15
+  | 'g' -> 16
+  | 'h' -> 17
+  | 'i' -> 18
+  | 'j' -> 19
+  | 'k' -> 20
+  | 'l' -> 21
+  | 'm' -> 22
+  | 'n' -> 23
+  | 'o' -> 24
+  | 'p' -> 25
+  | 'q' -> 26
+  | 'r' -> 27
+  | 's' -> 28
+  | 't' -> 29
+  | 'u' -> 30
+  | 'v' -> 31
+  | 'w' -> 32
+  | 'x' -> 33
+  | 'y' -> 34
+  | 'z' -> 35
+  | 'A' -> 36
+  | 'B' -> 37
+  | 'C' -> 38
+  | 'D' -> 39
+  | 'E' -> 40
+  | 'F' -> 41
+  | 'G' -> 42
+  | 'H' -> 43
+  | 'I' -> 44
+  | 'J' -> 45
+  | 'K' -> 46
+  | 'L' -> 47
+  | 'M' -> 48
+  | 'N' -> 49
+  | 'O' -> 50
+  | 'P' -> 51
+  | 'Q' -> 52
+  | 'R' -> 53
+  | 'S' -> 54
+  | 'T' -> 55
+  | 'U' -> 56
+  | 'V' -> 57
+  | 'W' -> 58
+  | 'X' -> 59
+  | 'Y' -> 60
+  | 'Z' -> 61
+  | _ -> raise Exit
+
+let base_convert src of_base to_base dst_len =
+  let dst = Array.create dst_len 0 in
+  let rec loop idx len =
+    let divide = ref 0 and newlen = ref 0 in
+    for i = 0 to len - 1 do
+      divide := !divide * of_base + src.(i);
+      if !divide >= to_base then begin
+        src.(!newlen) <- !divide / to_base;
+        incr newlen;
+        divide := !divide mod to_base
+      end else if !newlen > 0 then begin
+        src.(!newlen) <- 0;
+        incr newlen
+      end
+    done;
+    dst.(idx) <- !divide;
+    if !newlen <> 0 then loop (idx - 1) !newlen
+  in
+  loop (dst_len - 1) (Array.length src);
+  dst
+
+let base62_encode bytes len =
+  let src = Array.create (String.length bytes) 0 in
+  for i = 0 to String.length bytes - 1 do
+    src.(i) <- Char.code bytes.[i]
+  done;
+  let dst = base_convert src 256 62 len in
+  let res = String.create len in
+  for i = 0 to len - 1 do
+    res.[i] <- base62_of_code dst.(i)
+  done;
+  res
+
+let base62_decode str len =
+  let src = Array.create (String.length str) 0 in
+  for i = 0 to String.length str - 1 do
+    src.(i) <- code_of_base62 str.[i]
+  done;
+  let dst = base_convert src 62 256 len in
+  let res = String.create len in
+  for i = 0 to len - 1 do
+    res.[i] <- Char.chr dst.(i)
+  done;
+  res
+
+type link =
+  | Track of id
+  | Album of id
+  | Artist of id
+  | Search of string
+  | Playlist of string * id
+  | Image of id
+
+exception Invalid_uri of string
+
+let link_of_uri uri =
+  try
+    match split ':' uri with
+      | ["spotify"; "track"; arg] when String.length arg = 22 ->
+          Track (ID.of_bytes (base62_decode arg 16))
+      | ["spotify"; "album"; arg] when String.length arg = 22 ->
+          Album (ID.of_bytes (base62_decode arg 16))
+      | ["spotify"; "artist"; arg] when String.length arg = 22 ->
+          Artist (ID.of_bytes (base62_decode arg 16))
+      | ["search"; arg] ->
+          Search arg
+      | ["spotify"; "user"; user; "playlist"; arg] when String.length arg = 22 ->
+          Playlist (user, ID.of_bytes (base62_decode arg 16))
+      | ["spotify"; "image"; arg] when String.length arg = 40 ->
+          Image (id_of_string arg)
+      | _ ->
+          raise Exit
+  with _ ->
+    raise (Invalid_uri uri)
+
+let uri_of_link = function
+  | Track id ->
+      String.concat ":" ["spotify"; "track"; base62_encode (ID.to_bytes id) 22]
+  | Album id ->
+      String.concat ":" ["spotify"; "album"; base62_encode (ID.to_bytes id) 22]
+  | Artist id ->
+      String.concat ":" ["spotify"; "artist"; base62_encode (ID.to_bytes id) 22]
+  | Search str ->
+      String.concat ":" ["spotify"; "search"; str]
+  | Playlist (user, id) ->
+      String.concat ":" ["spotify"; "user"; user; "playlist"; base62_encode (ID.to_bytes id) 22]
+  | Image id ->
+      String.concat ":" ["spotify"; "image"; string_of_id id]
+
+(* +-----------------------------------------------------------------+
+   | Cache                                                           |
+   +-----------------------------------------------------------------+ *)
+
+module Weak_cache : sig
+  type 'a t
+    (* Type of object catching element of type ['a], indexed by an
+       ID. Element must be finalisable. *)
+
+  val create : int -> 'a t
+    (* Create a new empty cache. *)
+
+  val get : 'a t -> id -> 'a option
+    (* [get cache id] returns the element associated to [id] in
+       [cache] if any. *)
+
+  val add : 'a t -> id -> 'a -> unit
+    (* [add cache id x] binds [id] to [x] in [cache] if [id] is not
+       already bound. *)
+
+  val find : 'a t -> id -> (unit -> 'a) -> 'a
+    (* [find cache id make] search for an element with id [id] in
+       [cache]. If one is found it is returned, otherwise a new one is
+       created with [make], added to the cache and returned.
+
+       Note that the cache keeps only a weak reference to the element,
+       so its is removed when collected. *)
+
+  val find_lwt : 'a t -> id -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+    (* Same as find but [make] returns a thread. *)
+
+  val find_multiple_lwt : (< id : id; .. > as 'a) t -> id list -> (id list -> 'a list Lwt.t) -> 'a list Lwt.t
+    (* [find_multiple_lwt cache ids make] returns all elements found
+       in the cache, creating missing ones with [make]. *)
+end = struct
+  type 'a t = 'a Weak.t ID_table.t
+
+  let create size = ID_table.create size
+
+  let finalise cache id obj =
+    ID_table.remove cache id
+
+  let get cache id =
+    try
+      Weak.get (ID_table.find cache id) 0
+    with Not_found ->
+      None
+
+  let add cache id x =
+    try
+      let weak = ID_table.find cache id in
+      if Weak.get weak 0 = None then
+        Weak.set weak 0 (Some x)
+    with Not_found ->
+      let weak = Weak.create 1 in
+      Weak.set weak 0 (Some x);
+      ID_table.add cache id weak;
+      Gc.finalise (finalise cache id) x
+
+  let find cache id make =
+    try
+      let weak = ID_table.find cache id in
+      match Weak.get weak 0 with
+        | Some data ->
+            data
+        | None ->
+            let data = make () in
+            Weak.set weak 0 (Some data);
+            data
+    with Not_found ->
+      let data = make () in
+      let weak = Weak.create 1 in
+      Weak.set weak 0 (Some data);
+      ID_table.add cache id weak;
+      Gc.finalise (finalise cache id) data;
+      data
+
+  let find_lwt cache id make =
+    try
+      let weak = ID_table.find cache id in
+      match Weak.get weak 0 with
+        | Some data ->
+            return data
+        | None ->
+            lwt data = make () in
+            Weak.set weak 0 (Some data);
+            return data
+    with Not_found ->
+      lwt data = make () in
+      let weak = Weak.create 1 in
+      Weak.set weak 0 (Some data);
+      ID_table.add cache id weak;
+      Gc.finalise (finalise cache id) data;
+      return data
+
+  let find_multiple_lwt cache ids make =
+    let old_datas, ids =
+      split_either
+        (List.map
+           (fun id ->
+              try
+                match Weak.get (ID_table.find cache id) 0 with
+                  | Some data ->
+                      Inl data
+                  | None ->
+                      Inr id
+              with Not_found ->
+                Inr id)
+           ids)
+    in
+    lwt new_datas = make ids in
+    List.iter
+      (fun data ->
+         let weak = Weak.create 1 in
+         Weak.set weak 0 (Some data);
+         ID_table.add cache data#id weak;
+         Gc.finalise (finalise cache data#id) data)
+      new_datas;
+    return (old_datas @ new_datas)
+end
+
+(* +-----------------------------------------------------------------+
+   | Structures                                                      |
+   +-----------------------------------------------------------------+ *)
+
+class portrait id link width height = object
+  method id : id = id
+  method link : link = link
+  method width : int = width
+  method height : int = height
+end
+
+class biography text portraits = object
+  method text : string = text
+  method portraits : portrait list = portraits
+end
+
+class restriction catalogues forbidden allowed = object
+  method catalogues : string list option = catalogues
+  method forbidden : string list option = forbidden
+  method allowed : string list option = allowed
+end
+
+class similar_artist id link name portrait genres years_active restrictions = object
+  method id : id = id
+  method link : link = link
+  method name : string = name
+  method portrait : id option = portrait
+  method genres : string list = genres
+  method years_active : int list = years_active
+  method restrictions : restriction list = restrictions
+end
+
+class file id format bitrate = object
+  method id : id = id
+  method format : string = format
+  method bitrate : int = bitrate
+end
+
+class alternative id link files restrictions = object
+  method id : id = id
+  method link : link = link
+  method files : file list = files
+  method restrictions : restriction list = restrictions
+end
+
+class track id link title explicit artists artists_id album album_id album_artist album_artist_id year number length files cover popularity external_ids alternatives  = object
+  method id : id = id
+  method link : link = link
+  method title : string = title
+  method explicit : bool = explicit
+  method artists : string list = artists
+  method artists_id : id list = artists_id
+  method album : string = album
+  method album_id : id = album_id
+  method album_artist : string = album_artist
+  method album_artist_id : id = album_artist_id
+  method year : int = year
+  method number : int = number
+  method length : float = length
+  method files : file list = files
+  method cover : id option = cover
+  method popularity : float = popularity
+  method external_ids : (string * string) list = external_ids
+  method alternatives : alternative list = alternatives
+end
+
+class disc number name tracks = object
+  method number : int = number
+  method name : string option = name
+  method tracks : id list = tracks
+end
+
+class album id link name artist artist_id album_type year cover copyrights restrictions external_ids discs = object
+  method id : id = id
+  method link : link = link
+  method name : string = name
+  method artist : string = artist
+  method artist_id : id = artist_id
+  method album_type : string = album_type
+  method year : int = year
+  method cover : id option = cover
+  method copyrights : (string * string) list = copyrights
+  method restrictions : restriction list = restrictions
+  method external_ids : (string * string) list = external_ids
+  method discs : disc list = discs
+end
+
+class artist id link name portrait biographies similar_artists genres years_active albums = object
+  method id : id = id
+  method link : link = link
+  method name : string = name
+  method portrait : portrait option = portrait
+  method biographies : biography list = biographies
+  method similar_artists : similar_artist list = similar_artists
+  method genres : string list = genres
+  method years_active : int list = years_active
+  method albums : id list = albums
+end
+
+class artist_search id link name portrait popularity restrictions = object
+  method id : id = id
+  method link : link = link
+  method name : string = name
+  method portrait : portrait option = portrait
+  method popularity : float = popularity
+  method restrictions : restriction list = restrictions
+end
+
+class album_search id link name artist artist_id cover popularity restrictions external_ids = object
+  method id : id = id
+  method link : link = link
+  method name : string = name
+  method artist : string = artist
+  method artist_id : id = artist_id
+  method cover : id option = cover
+  method popularity : float = popularity
+  method restrictions : restriction list = restrictions
+  method external_ids : (string * string) list = external_ids
+end
+
+class simple_search_result link did_you_mean total_artists total_albums total_tracks = object
+  method link : link = link
+  method did_you_mean : string option = did_you_mean
+  method total_artists : int = total_artists
+  method total_albums : int = total_albums
+  method total_tracks : int = total_tracks
+end
+
+class search_result link did_you_mean total_artists total_albums total_tracks artists albums tracks = object
+  method link : link = link
+  method did_you_mean : string option = did_you_mean
+  method total_artists : int = total_artists
+  method total_albums : int = total_albums
+  method total_tracks : int = total_tracks
+  method artists : artist_search list = artists
+  method albums : album_search list = albums
+  method tracks : track list = tracks
+end
+
+class playlist id link name user time revision checksum collaborative tracks = object
+  method id : id = id
+  method link : link = link
+  method name : string = name
+  method user : string = user
+  method time : float = time
+  method revision : int = revision
+  method checksum : int = checksum
+  method collaborative : bool = collaborative
+  method tracks : id list = tracks
+end
+
+(* +-----------------------------------------------------------------+
+   | Writers                                                         |
+   +-----------------------------------------------------------------+ *)
+
+let write_portrait oc (portrait : portrait) =
+  XML.write_node oc "portrait" []
+    (fun oc ->
+       lwt () = XML.write_data oc "id" (string_of_id portrait#id) in
+       lwt () = XML.write_data oc "width" (string_of_int portrait#width) in
+       lwt () = XML.write_data oc "height" (string_of_int portrait#height) in
+       return ())
+
+let write_biography oc (bio : biography) =
+  XML.write_node oc "bio" []
+    (fun oc ->
+       lwt () = XML.write_data oc "text" bio#text in
+       lwt () = XML.write_nodes oc "portraits" write_portrait bio#portraits in
+       return ())
+
+let write_restriction oc (restriction : restriction) =
+  let attrs = [] in
+  let attrs = match restriction#allowed with Some l -> ("allowed", String.concat "," l) :: attrs | None -> attrs in
+  let attrs = match restriction#forbidden with Some l -> ("forbidden", String.concat "," l) :: attrs | None -> attrs in
+  let attrs = match restriction#catalogues with Some l -> ("catalogues", String.concat "," l) :: attrs | None -> attrs in
+  XML.write_empty_node oc "restriction" attrs
+
+let write_similar_artist oc (similar_artist : similar_artist) =
+  XML.write_node oc "similar-artist" []
+    (fun oc ->
+       lwt () = XML.write_data oc "id" (string_of_id similar_artist#id) in
+       lwt () = XML.write_data oc "name" similar_artist#name in
+       lwt () = match similar_artist#portrait with Some x -> XML.write_data oc "portrait" (string_of_id x) | None -> return () in
+       lwt () = XML.write_data oc "genres" (String.concat "," similar_artist#genres) in
+       lwt () = XML.write_data oc "years-active" (String.concat "," (List.map string_of_int similar_artist#years_active)) in
+       lwt () = XML.write_nodes oc "restrictions" write_restriction similar_artist#restrictions in
+       return ())
+
+let write_file oc file =
+  XML.write_empty_node oc "file" [("id", string_of_id file#id); ("format", Printf.sprintf "%s,%d" file#format file#bitrate)]
+
+let write_alternative oc (alternative : alternative) =
+  XML.write_node oc "track" []
+    (fun oc ->
+       lwt () = XML.write_data oc "id" (string_of_id alternative#id) in
+       lwt () = XML.write_nodes oc "files" write_file alternative#files in
+       lwt () = XML.write_nodes oc "restrictions" write_restriction alternative#restrictions in
+       return ())
+
+let write_external_id oc (t, i) =
+  XML.write_empty_node oc "external-id" [("type", t); ("id", i)]
+
+let write_track oc (track : track) =
+  XML.write_node oc "track" []
+    (fun oc ->
+       lwt () = XML.write_data oc "mlspot-cache-version" (string_of_int track_cache_version) in
+       lwt () = XML.write_data oc "id" (string_of_id track#id) in
+       lwt () = XML.write_data oc "title" track#title in
+       lwt () = XML.write_data oc "explicit" (string_of_bool track#explicit) in
+       lwt () = Lwt_list.iter_s (XML.write_data oc "artist") track#artists in
+       lwt () = Lwt_list.iter_s (XML.write_data oc "artist-id") (List.map string_of_id track#artists_id) in
+       lwt () = XML.write_data oc "album" track#album in
+       lwt () = XML.write_data oc "album-id" (string_of_id track#album_id) in
+       lwt () = XML.write_data oc "album-artist" track#album_artist in
+       lwt () = XML.write_data oc "album-artist-id" (string_of_id track#album_artist_id) in
+       lwt () = XML.write_data oc "track-number" (string_of_int track#number) in
+       lwt () = XML.write_data oc "length" (string_of_int (int_of_float (track#length *. 1000.))) in
+       lwt () = XML.write_nodes oc "files" write_file track#files in
+       lwt () = match track#cover with Some id -> XML.write_data oc "cover" (string_of_id id) | None -> return () in
+       lwt () = XML.write_data oc "year" (string_of_int track#year) in
+       lwt () = XML.write_data oc "popularity" (string_of_float track#popularity) in
+       lwt () = XML.write_nodes oc "external-ids" write_external_id track#external_ids in
+       lwt () = XML.write_nodes oc "alternatives" write_alternative track#alternatives in
+       return ())
+
+let write_track_id oc id =
+  XML.write_data oc "track" (string_of_id id)
+
+let write_disc oc disc =
+  XML.write_node oc "disc" []
+    (fun oc ->
+       lwt () = XML.write_data oc "disc-number" (string_of_int disc#number) in
+       lwt () = match disc#name with Some name -> XML.write_data oc "name" name | None -> return () in
+       lwt () = Lwt_list.iter_s (write_track_id oc) disc#tracks in
+       return ())
+
+let write_copyright oc (kind, data) =
+  XML.write_data oc kind data
+
+let write_album oc (album : album) =
+  XML.write_node oc "album" []
+    (fun oc ->
+       lwt () = XML.write_data oc "mlspot-cache-version" (string_of_int album_cache_version) in
+       lwt () = XML.write_data oc "id" (string_of_id album#id) in
+       lwt () = XML.write_data oc "name" album#name in
+       lwt () = XML.write_data oc "artist" album#artist in
+       lwt () = XML.write_data oc "artist-id" (string_of_id album#artist_id) in
+       lwt () = XML.write_data oc "album-type" album#album_type in
+       lwt () = XML.write_data oc "year" (string_of_int album#year) in
+       lwt () = match album#cover with Some id -> XML.write_data oc "cover" (string_of_id id) | None -> return () in
+       lwt () = XML.write_nodes oc "copyright" write_copyright album#copyrights in
+       lwt () = XML.write_nodes oc "restrictions" write_restriction album#restrictions in
+       lwt () = XML.write_nodes oc "external-ids" write_external_id album#external_ids in
+       lwt () = XML.write_nodes oc "discs" write_disc album#discs in
+       return ())
+
+let write_album_id oc id =
+  XML.write_data oc "album" (string_of_id id)
+
+let write_artist oc (artist : artist) =
+  XML.write_node oc "artist" []
+    (fun oc ->
+       lwt () = XML.write_data oc "mlspot-cache-version" (string_of_int artist_cache_version) in
+       lwt () = XML.write_data oc "id" (string_of_id artist#id) in
+       lwt () = XML.write_data oc "name" artist#name in
+       lwt () = match artist#portrait with Some portrait -> write_portrait oc portrait | None -> return () in
+       lwt () = XML.write_nodes oc "bios" write_biography artist#biographies in
+       lwt () = XML.write_nodes oc "similar-artists" write_similar_artist artist#similar_artists in
+       lwt () = XML.write_data oc "genres" (String.concat "," artist#genres) in
+       lwt () = XML.write_data oc "years-active" (String.concat "," (List.map string_of_int artist#years_active)) in
+       lwt () = XML.write_nodes oc "albums" write_album_id artist#albums in
+       return ())
+
+(* +-----------------------------------------------------------------+
    | Commands                                                        |
    +-----------------------------------------------------------------+ *)
 
@@ -1042,6 +1756,7 @@ type command =
   | CMD_P2P_INIT_BLOCK
   | CMD_BROWSE
   | CMD_SEARCH
+  | CMD_PLAYLIST_CHANGED
   | CMD_GET_DATA_PLAYLIST
   | CMD_CHANGE_PLAYLIST
   | CMD_NOTIFY
@@ -1074,6 +1789,7 @@ let string_of_command = function
   | CMD_P2P_INIT_BLOCK -> "CMD_P2P_INIT_BLOCK"
   | CMD_BROWSE -> "CMD_BROWSE"
   | CMD_SEARCH -> "CMD_SEARCH"
+  | CMD_PLAYLIST_CHANGED -> "CMD_PLAYLIST_CHANGED"
   | CMD_GET_DATA_PLAYLIST -> "CMD_GET_DATA_PLAYLIST"
   | CMD_CHANGE_PLAYLIST -> "CMD_CHANGE_PLAYLIST"
   | CMD_NOTIFY -> "CMD_NOTIFY"
@@ -1104,6 +1820,7 @@ let command_of_int = function
   | 0x21 -> CMD_P2P_INIT_BLOCK
   | 0x30 -> CMD_BROWSE
   | 0x31 -> CMD_SEARCH
+  | 0x34 -> CMD_PLAYLIST_CHANGED
   | 0x35 -> CMD_GET_DATA_PLAYLIST
   | 0x36 -> CMD_CHANGE_PLAYLIST
   | 0x42 -> CMD_NOTIFY
@@ -1135,6 +1852,7 @@ let int_of_command = function
   | CMD_P2P_INIT_BLOCK -> 0x21
   | CMD_BROWSE -> 0x30
   | CMD_SEARCH -> 0x31
+  | CMD_PLAYLIST_CHANGED -> 0x34
   | CMD_GET_DATA_PLAYLIST -> 0x35
   | CMD_CHANGE_PLAYLIST -> 0x36
   | CMD_NOTIFY -> 0x42
@@ -1218,12 +1936,15 @@ type session_parameters = {
 
   set_country_code : string -> unit;
   (* Set the country code. *)
+
+  playlists : ((unit -> unit) * playlist signal Weak.t) ID_table.t;
+  (* All playlist in use. *)
 }
 
 (* Sessions are objects so they are comparable and hashable. *)
 class session ?(use_cache = true) ?(cache_dir = Filename.concat xdg_cache_home "mlspot") () =
-  let products, set_products = React.S.create ([] : product list) in
-  let country_code, set_country_code = React.S.create "" in
+  let products, set_products = S.create ([] : product list) in
+  let country_code, set_country_code = S.create "" in
 object
   val mutable session_parameters : session_parameters option = None
     (* Session parameters for online sessions. *)
@@ -1450,7 +2171,13 @@ let recv_packet sp =
   let payload = String.create packet_len in
   lwt () = or_logout sp (Lwt_io.read_into_exactly sp.ic payload 0 packet_len) in
   shn_decrypt sp.shn_recv payload 0 packet_len;
-  return (command_of_int (Char.code (String.unsafe_get header 0)), String.sub payload 0 len)
+  let payload = String.sub payload 0 len in
+  try
+    let command = command_of_int (Char.code (String.unsafe_get header 0)) in
+    return (command, payload)
+  with Unknown_command cmd as exn ->
+    if debug then delay (save_raw_data (Printf.sprintf "unknown command 0x%02x" cmd) payload);
+    raise_lwt exn
 
 (* +-----------------------------------------------------------------+
    | Cache                                                           |
@@ -1576,1202 +2303,6 @@ module Cache = struct
     else
       return None
 end
-
-(* +-----------------------------------------------------------------+
-   | Dispatching                                                     |
-   +-----------------------------------------------------------------+ *)
-
-lwt dir_save_raw, debug =
-  match try Some (Sys.getenv "MLSPOT_DEBUG_DIR") with Not_found -> None with
-    | None ->
-        return (None, false)
-    | Some dir ->
-        lwt ok = mkdir_p dir in
-        lwt oc_types = Lwt_io.open_file ~mode:Lwt_io.output (Filename.concat dir "types")
-        and oc_log = Lwt_io.open_file ~mode:Lwt_io.output (Filename.concat dir "log") in
-        Lwt_log.add_rule "*" Lwt_log.Debug;
-        Lwt_log.default := Lwt_log.broadcast [
-          !Lwt_log.default;
-          Lwt_log.channel ~template:"$(date).$(milliseconds): $(loc-file), line $(loc-line): $(message)" ~close_mode:`Close ~channel:oc_log ();
-        ];
-        return (Some (dir, oc_types), true)
-
-let next_save_id = ref 0
-
-let save_raw_data kind str =
-  match dir_save_raw with
-    | Some (dir, oc) ->
-        let id = !next_save_id in
-        next_save_id := id + 1;
-        lwt () = Lwt_io.fprintlf oc "%08x: %s" id kind in
-        Lwt_io.with_file ~mode:Lwt_io.output (Filename.concat dir (Printf.sprintf "%08x" id)) (fun oc -> Lwt_io.write oc str)
-    | None ->
-        return ()
-
-let dispatch sp command payload =
-  match command with
-    | CMD_SECRET_BLOCK ->
-        send_packet sp CMD_CACHE_HASH "\xf4\xc2\xaa\x05\xe8\x25\xa7\xb5\xe4\xe6\x59\x0f\x3d\xd0\xbe\x0a\xef\x20\x51\x95"
-
-    | CMD_PING ->
-        send_packet sp CMD_PONG "\x00\x00\x00\x00"
-
-    | CMD_PONG_ACK ->
-        return ()
-
-    | CMD_WELCOME ->
-        wakeup sp.login_wakener ();
-        return ()
-
-    | CMD_PROD_INFO -> begin
-        delay (save_raw_data "products info" payload);
-        let cell = ref None in
-        let products = XML.parse_string cell (new products_parser (fun x -> cell := Some x)) payload in
-        try
-          sp.set_products products;
-          return ()
-        with exn ->
-          ignore (Lwt_log.error ~section ~exn "failed to set products informations");
-          return ()
-      end
-
-    | CMD_COUNTRY_CODE -> begin
-        delay (save_raw_data "country code" payload);
-        try
-          sp.set_country_code payload;
-          return ()
-        with exn ->
-          ignore (Lwt_log.error ~section ~exn "failed to set the country code");
-          return ()
-      end
-
-    | CMD_CHANNEL_DATA ->
-        if String.length payload < 2 then
-          Lwt_log.error ~section "invalid channel data received"
-        else begin
-          (* Read the channel id. *)
-          let id = get_int16 payload 0 in
-          delay (save_raw_data "channel data" payload);
-          match try Some (Channel_map.find id sp.channels) with Not_found -> None with
-            | None ->
-                Lwt_log.error ~section "channel data from unknown channel received"
-
-            | Some channel ->
-                if String.length payload = 2 then begin
-                  (* End of channel. *)
-                  release_channel sp id;
-                  channel.ch_done <- true;
-                  Lwt_condition.signal channel.ch_cond ();
-                  return ()
-                end else begin
-                  Queue.add (payload, 2, String.length payload - 2) channel.ch_data;
-                  Lwt_condition.signal channel.ch_cond ();
-                  return ()
-                end
-        end
-
-    | CMD_CHANNEL_ERROR ->
-        if String.length payload < 2 then
-          Lwt_log.error ~section "invalid channel error received"
-        else begin
-          (* Read the channel id. *)
-          let id = get_int16 payload 0 in
-          delay (save_raw_data "channel error" payload);
-          match try Some (Channel_map.find id sp.channels) with Not_found -> None with
-            | None ->
-                Lwt_log.error ~section "channel error from unknown channel received"
-
-            | Some channel ->
-                release_channel sp id;
-                wakeup_exn channel.ch_error_wakener (Error "channel error");
-                return ()
-        end
-
-    | CMD_AES_KEY ->
-        if String.length payload < 4 then
-          Lwt_log.error ~section "invalid AES key received"
-        else begin
-          let id = get_int16 payload 2 in
-          delay (save_raw_data "aes key" payload);
-          match try Some (Channel_map.find id sp.channels) with Not_found -> None with
-            | None ->
-                Lwt_log.error ~section "AES key from unknown channel received"
-
-            | Some channel ->
-                release_channel sp id;
-                Queue.add (payload, 4, String.length payload - 4) channel.ch_data;
-                channel.ch_done <- true;
-                Lwt_condition.signal channel.ch_cond ();
-                return ()
-        end
-
-    | CMD_AES_KEY_ERROR ->
-        if String.length payload < 4 then
-          Lwt_log.error ~section "invalid AES key error received"
-        else begin
-          let id = get_int16 payload 2 in
-          delay (save_raw_data "aes key error" payload);
-          match try Some (Channel_map.find id sp.channels) with Not_found -> None with
-            | None ->
-                Lwt_log.error ~section "AES key error from unknown channel received"
-
-            | Some channel ->
-                release_channel sp id;
-                wakeup_exn channel.ch_error_wakener (Error "key error");
-                return ()
-        end
-
-    | _ ->
-        Lwt_log.info_f ~section "do not know what to do with command '%s'" (string_of_command command)
-
-let disconnect sp =
-  if not sp.disconnected then begin
-    sp.disconnected <- true;
-    wakeup_exn sp.logout_wakener Disconnected;
-    try_lwt
-      Lwt_io.flush sp.oc
-    finally
-      Lwt_unix.shutdown sp.socket Unix.SHUTDOWN_ALL;
-      Lwt_unix.close sp.socket
-  end else
-    return ()
-
-let rec loop_dispatch sp =
-  lwt () =
-    try_lwt
-      lwt command, payload = recv_packet sp in
-      ignore (
-        try_lwt
-          dispatch sp command payload
-        with exn ->
-          Lwt_log.error ~section ~exn "dispatcher failed with"
-      );
-      return ()
-    with
-      | Unknown_command command ->
-          ignore (Lwt_log.error_f ~section "unknown command received (0x%02x)" command);
-          return ()
-      | Logged_out | Disconnected ->
-          return ()
-      | End_of_file ->
-          disconnect sp
-      | exn ->
-          ignore (Lwt_log.error ~section ~exn "command reader failed with");
-          disconnect sp
-  in
-  loop_dispatch sp
-
-(* +-----------------------------------------------------------------+
-   | Loggin/logout                                                   |
-   +-----------------------------------------------------------------+ *)
-
-exception Connection_failure of string
-
-let dh_parameters = {
-  Cryptokit.DH.p = "\
-\xff\xff\xff\xff\xff\xff\xff\xff\xc9\x0f\xda\xa2\x21\x68\xc2\x34\
-\xc4\xc6\x62\x8b\x80\xdc\x1c\xd1\x29\x02\x4e\x08\x8a\x67\xcc\x74\
-\x02\x0b\xbe\xa6\x3b\x13\x9b\x22\x51\x4a\x08\x79\x8e\x34\x04\xdd\
-\xef\x95\x19\xb3\xcd\x3a\x43\x1b\x30\x2b\x0a\x6d\xf2\x5f\x14\x37\
-\x4f\xe1\x35\x6d\x6d\x51\xc2\x45\xe4\x85\xb5\x76\x62\x5e\x7e\xc6\
-\xf4\x4c\x42\xe9\xa6\x3a\x36\x20\xff\xff\xff\xff\xff\xff\xff\xff";
-  Cryptokit.DH.g = "\x02";
-  Cryptokit.DH.privlen = 160;
-}
-
-let key = "\
-\xae\xd6\xb1\xf6\xf2\x67\x44\xdb\xf1\x79\x85\x30\xc9\xfc\xcc\x35\
-\xb0\x86\x81\x0d\x1d\x87\x2f\x0f\xba\xa8\xbe\x71\x7a\x43\xac\xc6\
-\xd3\x73\x88\x2c\xdf\x3b\x6e\x96\x56\xae\x8b\x18\x93\x56\x77\xb1\
-\xa0\xe0\x4e\xea\xa7\xea\x1d\xbd\xb1\xc5\x95\xb4\x30\xc3\x31\xf1\
-\x57\x4f\x0e\xb8\xc8\x3a\xd6\xb3\x9a\xab\x71\xdc\xbb\x3b\x4d\xb9\
-\x84\x31\x65\x18\x79\x13\x73\xe8\xa6\xe3\xc8\x9b\x56\xcf\x25\x8e\
-\x49\x83\x2d\xe1\x84\xcd\xd4\x5d\x06\xe4\x41\x99\xc7\x0b\x37\x5c\
-\x08\x3e\xdc\x86\x8d\xb0\x21\xbe\xc1\x53\xcb\xf8\xcc\x4f\x40\x13"
-
-let logout session =
-  match session#get_session_parameters with
-    | None ->
-        return ()
-    | Some sp ->
-        session#set_session_parameters None;
-        disconnect sp
-
-let login session ~username ~password =
-  lwt () = logout session in
-
-  lwt socket =
-    try_lwt
-      (* Service lookup. *)
-      lwt servers =
-        try_lwt
-          service_lookup ()
-        with Unix.Unix_error (error, _, _) ->
-          ignore (Lwt_log.warning_f ~section "service lookup failed: %s" (Unix.error_message error));
-          return [(0, "ap.spotify.com", 4070)]
-      in
-
-      (* Sort servers. *)
-      let servers = List.sort (fun (prio1, _, _) (prio2, _, _) -> prio1 - prio2) servers in
-
-      (* Read address informations. *)
-      lwt address_infos =
-        Lwt_list.map_p
-          (fun (priority, host, port) ->
-             Lwt_unix.getaddrinfo host (string_of_int port) [Unix.AI_SOCKTYPE Unix.SOCK_STREAM; Unix.AI_PROTOCOL 0])
-          servers
-        >|= List.flatten
-      in
-
-      (* Try to connect to a server. *)
-      let rec loop address_infos =
-        match address_infos with
-          | [] ->
-              raise_lwt (Connection_failure "no server available")
-          | address_info :: address_infos ->
-              let sock = Lwt_unix.socket address_info.Unix.ai_family address_info.Unix.ai_socktype address_info.Unix.ai_protocol in
-              try_lwt
-                (* Try to connect. *)
-                lwt () = Lwt_unix.connect sock address_info.Unix.ai_addr in
-                return sock
-              with Unix.Unix_error _ ->
-                lwt () = Lwt_unix.close sock in
-                (* Try other addresses. *)
-                loop address_infos
-      in
-
-      loop address_infos
-
-    with Unix.Unix_error (error, _, _) ->
-      raise_lwt (Connection_failure (Unix.error_message error))
-  in
-
-  try_lwt
-    let ic = Lwt_io.make ~mode:Lwt_io.input (Lwt_bytes.read socket)
-    and oc = Lwt_io.make ~mode:Lwt_io.output (Lwt_bytes.write socket) in
-
-    (* Create a new random number generator.
-       [Cryptokit.Random.secure_rng] is far two slow, so we get some
-       random random bytes from /dev/random and complete with pseudo
-       random data. *)
-    let random = String.create 55 in
-    let offset =
-      try
-        let fd = Unix.openfile "/dev/random" [Unix.O_RDONLY; Unix.O_NONBLOCK] 0 in
-        begin
-          try
-            let offset = Unix.read fd random 0 (String.length random) in
-            Unix.close fd;
-            ignore (Lwt_log.info_f ~section "%d random bytes read from /dev/random" offset);
-            offset
-          with _ ->
-            ignore (Lwt_log.info_f ~section "0 random bytes read from /dev/random");
-            Unix.close fd;
-            0
-        end
-      with _ ->
-        0
-    in
-    if offset < String.length random then begin
-      let state = Random.State.make_self_init () in
-      for i = offset to String.length random - 1 do
-        random.[i] <- Char.unsafe_chr (Random.State.int state 256)
-      done;
-    end;
-
-    (* Create the random number generator. *)
-    let rng = Cryptokit.Random.pseudo_rng random in
-
-    (* Generate random data. *)
-    let client_random = Cryptokit.Random.string rng 16 in
-
-    (* Generate a secret. *)
-    let secret = Cryptokit.DH.private_secret ~rng dh_parameters in
-
-    (* Forge the initial packet. *)
-    let packet = Packet.create () in
-
-    (* Protocol version. *)
-    Packet.add_int16 packet 3;
-    (* Packet length, updated later. *)
-    Packet.add_int16 packet 0;
-    (* Unknown. *)
-    Packet.add_int32 packet 0x00000300;
-    (* Unknown. *)
-    Packet.add_int32 packet 0x00030c00;
-    (* Client revision. *)
-    Packet.add_int32 packet 99999;
-    (* Unknown. *)
-    Packet.add_int32 packet 0;
-    (* Unknown. *)
-    Packet.add_int32 packet 0x01000000;
-    (* Client ID. *)
-    Packet.add_int32 packet 0x01040101;
-    (* Unknown. *)
-    Packet.add_int32 packet 0;
-    (* Random data. *)
-    Packet.add_string packet client_random;
-    (* DH message. *)
-    Packet.add_string packet (Cryptokit.DH.message dh_parameters secret);
-    (* RSA modulus. *)
-    Packet.add_string packet key;
-    (* Length of random data. *)
-    Packet.add_int8 packet 0;
-    Packet.add_int8 packet (String.length username);
-    (* Unknown. *)
-    Packet.add_int16 packet 0x0100;
-    (* <-- random data would go here *)
-    Packet.add_string packet username;
-    (* Unknown. *)
-    Packet.add_int8 packet 0x40;
-    (* Update length bytes. *)
-    Packet.put_int16 packet 2 (Packet.length packet);
-
-    (* Save the initial client packet. *)
-    let init_client = Packet.contents packet in
-
-    (* Send the packet. *)
-    lwt () = Packet.send oc packet in
-    lwt () = Lwt_io.flush oc in
-
-    Packet.reset packet;
-
-    let server_random = String.create 16 in
-
-    (* Read 2 status bytes. *)
-    lwt () = Lwt_io.read_into_exactly ic server_random 0 2 in
-
-    if server_random.[0] <> '\x00' then begin
-      match Char.code server_random.[1] with
-        | 0x01 -> raise (Authentication_failure "client upgrade recquired")
-        | 0x03 -> raise (Authentication_failure "user not found")
-        | 0x04 -> raise (Authentication_failure "account has been disabled")
-        | 0x06 -> raise (Authentication_failure "you need to complete your account details")
-        | 0x09 -> raise (Authentication_failure "country mismatch")
-        | code -> raise (Authentication_failure (Printf.sprintf "unknown error (%d)" code))
-    end;
-
-    (* Read remaining 14 random bytes. *)
-    lwt () = Lwt_io.read_into_exactly ic server_random 2 14 in
-    Packet.add_string packet server_random;
-
-    let public_key = String.create 96 in
-    lwt () = Lwt_io.read_into_exactly ic public_key 0 96 in
-    Packet.add_string packet public_key;
-
-    let blob = String.create 256 in
-    lwt () = Lwt_io.read_into_exactly ic blob 0 256 in
-    Packet.add_string packet blob;
-
-    let salt = String.create 10 in
-    lwt () = Lwt_io.read_into_exactly ic salt 0 10 in
-    Packet.add_string packet salt;
-
-    lwt padding_length = Lwt_io.read_char ic >|= Char.code in
-    Packet.add_int8 packet padding_length;
-    lwt username_length = Lwt_io.read_char ic >|= Char.code in
-    Packet.add_int8 packet username_length;
-    let puzzle_length = ref 0 in
-    lwt () =
-      for_lwt i = 0 to 3 do
-        lwt len0 = Lwt_io.read_char ic >|= Char.code in
-        lwt len1 = Lwt_io.read_char ic >|= Char.code in
-        Packet.add_int8 packet len0;
-        Packet.add_int8 packet len1;
-        puzzle_length := !puzzle_length + ((len0 lsl 8) lor len1);
-        return ()
-      done
-    in
-
-    let padding = String.create padding_length in
-    lwt () = Lwt_io.read_into_exactly ic padding 0 padding_length in
-    Packet.add_string packet padding;
-
-    let username = String.create username_length in
-    lwt () = Lwt_io.read_into_exactly ic username 0 username_length in
-    Packet.add_string packet username;
-
-    let puzzle = String.create !puzzle_length in
-    lwt () = Lwt_io.read_into_exactly ic puzzle 0 !puzzle_length in
-    Packet.add_string packet puzzle;
-
-    (* Save the initial server packet. *)
-    let init_server = Packet.contents packet in
-
-    if String.length puzzle < 6 || puzzle.[0] <> '\x01' then
-      raise (Authentication_failure "unexpected puzzle challenge");
-    let denominator = 1 lsl (Char.code puzzle.[1]) - 1 in
-    let magic = get_int32 puzzle 2 in
-
-    (* Compute the shared secret. *)
-    let shared_secret = Cryptokit.DH.shared_secret dh_parameters secret public_key in
-
-    (* Hash of the salt and the password. *)
-    let ctx = Cryptokit.Hash.sha1 () in
-    ctx#add_string salt;
-    ctx#add_char ' ';
-    ctx#add_string password;
-    let auth_hash = ctx#result in
-
-    let message = auth_hash ^ client_random ^ server_random ^ "\x00" in
-
-    let hmac_output = String.create (20 * 5) in
-    for i = 1 to 5 do
-      message.[52] <- char_of_int i;
-      let ctx = Cryptokit.MAC.hmac_sha1 shared_secret in
-      ctx#add_string message;
-      let hmac = ctx#result in
-      String.blit hmac 0 hmac_output ((i - 1) * 20) 20;
-      String.blit hmac 0 message 0 20
-    done;
-
-    let shn_send = shn_ctx_new () in
-    let shn_recv = shn_ctx_new () in
-    shn_key shn_send hmac_output 20 32;
-    shn_key shn_recv hmac_output 52 32;
-
-    let key_hmac = String.sub hmac_output 0 20 in
-
-    (* Solve the puzzle. *)
-    let solution = String.create 8 in
-    Random.self_init ();
-    let rec loop () =
-      let ctx = Cryptokit.Hash.sha1 () in
-      ctx#add_string server_random;
-      for i = 0 to 7 do
-        solution.[i] <- char_of_int (Random.int 256)
-      done;
-      ctx#add_string solution;
-      let digest = ctx#result in
-      let nominator = get_int32 digest 16 in
-      if (nominator lxor magic) land denominator <> 0 then loop ()
-    in
-    loop ();
-
-    Packet.reset packet;
-    Packet.add_string packet init_client;
-    Packet.add_string packet init_server;
-    (* Random data length. *)
-    Packet.add_int8 packet 0;
-    (* Unknown. *)
-    Packet.add_int8 packet 0;
-    (* Puzzle solution length. *)
-    Packet.add_int16 packet 8;
-    (* Unknown. *)
-    Packet.add_int32 packet 0;
-    (* <-- random data would go here. *)
-    Packet.add_string packet solution;
-
-    let ctx = Cryptokit.MAC.hmac_sha1 key_hmac in
-    ctx#add_substring (Packet.buffer packet) 0 (Packet.length packet);
-    let auth_hmac = ctx#result in
-
-    (* Forge the authentication packet. *)
-    Packet.reset packet;
-
-    Packet.add_string packet auth_hmac;
-    (* Random data length. *)
-    Packet.add_int8 packet 0;
-    (* Unknown. *)
-    Packet.add_int8 packet 0;
-    (* Puzzle solution length. *)
-    Packet.add_int16 packet 8;
-    (* Unknown. *)
-    Packet.add_int32 packet 0;
-    (* <-- random data would go here. *)
-    Packet.add_string packet solution;
-
-    (* Send the packet. *)
-    lwt () = Packet.send oc packet in
-
-    (* Read the response. *)
-    lwt status = Lwt_io.read_char ic >|= Char.code in
-    if status <> 0 then raise (Authentication_failure "authentication failed");
-
-    (* Read the payload length. *)
-    lwt payload_length = Lwt_io.read_char ic >|= Char.code in
-
-    (* Read the payload. *)
-    let payload = String.create payload_length in
-    lwt () = Lwt_io.read_into_exactly ic payload 0 payload_length in
-
-    let login_waiter, login_wakener = task () in
-    let logout_waiter, logout_wakener = wait () in
-    let sp = {
-      disconnected = false;
-      socket;
-      ic;
-      oc;
-      shn_send;
-      shn_recv;
-      send_iv = 0;
-      recv_iv = 0;
-      channels = Channel_map.empty;
-      next_channel_id = 0;
-      channel_released = Lwt_condition.create ();
-      login_waiter;
-      login_wakener;
-      logout_waiter;
-      logout_wakener;
-      set_products = session#set_products;
-      set_country_code = session#set_country_code;
-    } in
-
-    (* Start the dispatcher. *)
-    ignore (loop_dispatch sp);
-
-    try_lwt
-      lwt () = login_waiter in
-      session#set_session_parameters (Some sp);
-      return ()
-
-    with exn ->
-      (* Make sure the dispatcher exit. *)
-      wakeup_exn logout_wakener Logged_out;
-      raise_lwt exn
-
-  with exn ->
-    Lwt_unix.shutdown socket Unix.SHUTDOWN_ALL;
-    lwt () = Lwt_unix.close socket in
-    raise_lwt exn
-
-(* +-----------------------------------------------------------------+
-   | IDs                                                             |
-   +-----------------------------------------------------------------+ *)
-
-exception Id_parse_failure
-exception Wrong_id of string
-
-module ID : sig
-  type t
-    (* Note: ID are comparable using (==). *)
-
-  val length : t -> int
-  val hash : t -> int
-
-  val of_string : string -> t
-  val to_string : t -> string
-
-  val to_bytes : t -> string
-    (* Warning: the result must not be modified. *)
-
-  val of_bytes : string -> t
-    (* Warning: the string must not be modified. *)
-end = struct
-
-  type t = {
-    bytes : string;
-    hash : int;
-  }
-
-  type id = t
-
-  module IDs = Weak.Make (struct
-                            type t = id
-                            let equal id1 id2 = id1.bytes = id2.bytes
-                            let hash id = id.hash
-                          end)
-
-  (* Weak table of all encountered ids. *)
-  let ids = IDs.create 16384
-
-  let length id = String.length id.bytes
-  let hash id = id.hash
-
-  let to_bytes id = id.bytes
-  let of_bytes bytes = IDs.merge ids { bytes; hash = Hashtbl.hash bytes }
-
-  let int_of_hexa = function
-    | '0' .. '9' as ch -> Char.code ch - Char.code '0'
-    | 'a' .. 'f' as ch -> Char.code ch - Char.code 'a' + 10
-    | 'A' .. 'F' as ch -> Char.code ch - Char.code 'A' + 10
-    | _ -> raise Id_parse_failure
-
-  let of_string str =
-    let len = String.length str in
-    if len land 1 <> 0 then raise Id_parse_failure;
-    let bytes = String.create (len / 2) in
-    for i = 0 to len / 2 - 1 do
-      let x0 = int_of_hexa (String.unsafe_get str (i * 2 + 0)) in
-      let x1 = int_of_hexa (String.unsafe_get str (i * 2 + 1)) in
-      String.unsafe_set bytes i (Char.unsafe_chr ((x0 lsl 4) lor x1))
-    done;
-    of_bytes bytes
-
-  let hexa_of_int n =
-    if n < 10 then
-      Char.unsafe_chr (Char.code '0' + n)
-    else
-      Char.unsafe_chr (Char.code 'a' + n - 10)
-
-  let to_string id =
-    let len = String.length id.bytes in
-    let str = String.create (len * 2) in
-    for i = 0 to len - 1 do
-      let x = Char.code (String.unsafe_get id.bytes i) in
-      String.unsafe_set str (i * 2 + 0) (hexa_of_int (x lsr 4));
-      String.unsafe_set str (i * 2 + 1) (hexa_of_int (x land 15))
-    done;
-    str
-end
-
-type id = ID.t
-let id_length = ID.length
-let id_hash = ID.hash
-let id_of_string = ID.of_string
-let string_of_id = ID.to_string
-
-(* +-----------------------------------------------------------------+
-   | Links                                                           |
-   +-----------------------------------------------------------------+ *)
-
-type uri = string
-
-let base62_alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-let base62_of_code x = base62_alphabet.[x]
-
-let code_of_base62 = function
-  | '0' -> 0
-  | '1' -> 1
-  | '2' -> 2
-  | '3' -> 3
-  | '4' -> 4
-  | '5' -> 5
-  | '6' -> 6
-  | '7' -> 7
-  | '8' -> 8
-  | '9' -> 9
-  | 'a' -> 10
-  | 'b' -> 11
-  | 'c' -> 12
-  | 'd' -> 13
-  | 'e' -> 14
-  | 'f' -> 15
-  | 'g' -> 16
-  | 'h' -> 17
-  | 'i' -> 18
-  | 'j' -> 19
-  | 'k' -> 20
-  | 'l' -> 21
-  | 'm' -> 22
-  | 'n' -> 23
-  | 'o' -> 24
-  | 'p' -> 25
-  | 'q' -> 26
-  | 'r' -> 27
-  | 's' -> 28
-  | 't' -> 29
-  | 'u' -> 30
-  | 'v' -> 31
-  | 'w' -> 32
-  | 'x' -> 33
-  | 'y' -> 34
-  | 'z' -> 35
-  | 'A' -> 36
-  | 'B' -> 37
-  | 'C' -> 38
-  | 'D' -> 39
-  | 'E' -> 40
-  | 'F' -> 41
-  | 'G' -> 42
-  | 'H' -> 43
-  | 'I' -> 44
-  | 'J' -> 45
-  | 'K' -> 46
-  | 'L' -> 47
-  | 'M' -> 48
-  | 'N' -> 49
-  | 'O' -> 50
-  | 'P' -> 51
-  | 'Q' -> 52
-  | 'R' -> 53
-  | 'S' -> 54
-  | 'T' -> 55
-  | 'U' -> 56
-  | 'V' -> 57
-  | 'W' -> 58
-  | 'X' -> 59
-  | 'Y' -> 60
-  | 'Z' -> 61
-  | _ -> raise Exit
-
-let base_convert src of_base to_base dst_len =
-  let dst = Array.create dst_len 0 in
-  let rec loop idx len =
-    let divide = ref 0 and newlen = ref 0 in
-    for i = 0 to len - 1 do
-      divide := !divide * of_base + src.(i);
-      if !divide >= to_base then begin
-        src.(!newlen) <- !divide / to_base;
-        incr newlen;
-        divide := !divide mod to_base
-      end else if !newlen > 0 then begin
-        src.(!newlen) <- 0;
-        incr newlen
-      end
-    done;
-    dst.(idx) <- !divide;
-    if !newlen <> 0 then loop (idx - 1) !newlen
-  in
-  loop (dst_len - 1) (Array.length src);
-  dst
-
-let base62_encode bytes len =
-  let src = Array.create (String.length bytes) 0 in
-  for i = 0 to String.length bytes - 1 do
-    src.(i) <- Char.code bytes.[i]
-  done;
-  let dst = base_convert src 256 62 len in
-  let res = String.create len in
-  for i = 0 to len - 1 do
-    res.[i] <- base62_of_code dst.(i)
-  done;
-  res
-
-let base62_decode str len =
-  let src = Array.create (String.length str) 0 in
-  for i = 0 to String.length str - 1 do
-    src.(i) <- code_of_base62 str.[i]
-  done;
-  let dst = base_convert src 62 256 len in
-  let res = String.create len in
-  for i = 0 to len - 1 do
-    res.[i] <- Char.chr dst.(i)
-  done;
-  res
-
-type link =
-  | Track of id
-  | Album of id
-  | Artist of id
-  | Search of string
-  | Playlist of string * id
-  | Image of id
-
-exception Invalid_uri of string
-
-let link_of_uri uri =
-  try
-    match split ':' uri with
-      | ["spotify"; "track"; arg] when String.length arg = 22 ->
-          Track (ID.of_bytes (base62_decode arg 16))
-      | ["spotify"; "album"; arg] when String.length arg = 22 ->
-          Album (ID.of_bytes (base62_decode arg 16))
-      | ["spotify"; "artist"; arg] when String.length arg = 22 ->
-          Artist (ID.of_bytes (base62_decode arg 16))
-      | ["search"; arg] ->
-          Search arg
-      | ["spotify"; "user"; user; "playlist"; arg] when String.length arg = 22 ->
-          Playlist (user, ID.of_bytes (base62_decode arg 16))
-      | ["spotify"; "image"; arg] when String.length arg = 40 ->
-          Image (id_of_string arg)
-      | _ ->
-          raise Exit
-  with _ ->
-    raise (Invalid_uri uri)
-
-let uri_of_link = function
-  | Track id ->
-      String.concat ":" ["spotify"; "track"; base62_encode (ID.to_bytes id) 22]
-  | Album id ->
-      String.concat ":" ["spotify"; "album"; base62_encode (ID.to_bytes id) 22]
-  | Artist id ->
-      String.concat ":" ["spotify"; "artist"; base62_encode (ID.to_bytes id) 22]
-  | Search str ->
-      String.concat ":" ["spotify"; "search"; str]
-  | Playlist (user, id) ->
-      String.concat ":" ["spotify"; "user"; user; "playlist"; base62_encode (ID.to_bytes id) 22]
-  | Image id ->
-      String.concat ":" ["spotify"; "image"; string_of_id id]
-
-(* +-----------------------------------------------------------------+
-   | Cache                                                           |
-   +-----------------------------------------------------------------+ *)
-
-module Weak_cache : sig
-  type 'a t
-    (* Type of object catching element of type ['a], indexed by an
-       ID. Element must be finalisable. *)
-
-  val create : int -> 'a t
-    (* Create a new empty cache. *)
-
-  val get : 'a t -> id -> 'a option
-    (* [get cache id] returns the element associated to [id] in
-       [cache] if any. *)
-
-  val add : 'a t -> id -> 'a -> unit
-    (* [add cache id x] binds [id] to [x] in [cache] if [id] is not
-       already bound. *)
-
-  val find : 'a t -> id -> (unit -> 'a) -> 'a
-    (* [find cache id make] search for an element with id [id] in
-       [cache]. If one is found it is returned, otherwise a new one is
-       created with [make], added to the cache and returned.
-
-       Note that the cache keeps only a weak reference to the element,
-       so its is removed when collected. *)
-
-  val find_lwt : 'a t -> id -> (unit -> 'a Lwt.t) -> 'a Lwt.t
-    (* Same as find but [make] returns a thread. *)
-
-  val find_multiple_lwt : (< id : id; .. > as 'a) t -> id list -> (id list -> 'a list Lwt.t) -> 'a list Lwt.t
-    (* [find_multiple_lwt cache ids make] returns all elements found
-       in the cache, creating missing ones with [make]. *)
-end = struct
-  module Table = Hashtbl.Make (struct
-                                 type t = id
-                                 let equal = ( == )
-                                 let hash = id_hash
-                               end)
-
-  type 'a t = 'a Weak.t Table.t
-
-  let create size = Table.create size
-
-  let finalise cache id obj =
-    Table.remove cache id
-
-  let get cache id =
-    try
-      Weak.get (Table.find cache id) 0
-    with Not_found ->
-      None
-
-  let add cache id x =
-    try
-      let weak = Table.find cache id in
-      if Weak.get weak 0 = None then
-        Weak.set weak 0 (Some x)
-    with Not_found ->
-      let weak = Weak.create 1 in
-      Weak.set weak 0 (Some x);
-      Table.add cache id weak;
-      Gc.finalise (finalise cache id) x
-
-  let find cache id make =
-    try
-      let weak = Table.find cache id in
-      match Weak.get weak 0 with
-        | Some data ->
-            data
-        | None ->
-            let data = make () in
-            Weak.set weak 0 (Some data);
-            data
-    with Not_found ->
-      let data = make () in
-      let weak = Weak.create 1 in
-      Weak.set weak 0 (Some data);
-      Table.add cache id weak;
-      Gc.finalise (finalise cache id) data;
-      data
-
-  let find_lwt cache id make =
-    try
-      let weak = Table.find cache id in
-      match Weak.get weak 0 with
-        | Some data ->
-            return data
-        | None ->
-            lwt data = make () in
-            Weak.set weak 0 (Some data);
-            return data
-    with Not_found ->
-      lwt data = make () in
-      let weak = Weak.create 1 in
-      Weak.set weak 0 (Some data);
-      Table.add cache id weak;
-      Gc.finalise (finalise cache id) data;
-      return data
-
-  let find_multiple_lwt cache ids make =
-    let old_datas, ids =
-      split_either
-        (List.map
-           (fun id ->
-              try
-                match Weak.get (Table.find cache id) 0 with
-                  | Some data ->
-                      Inl data
-                  | None ->
-                      Inr id
-              with Not_found ->
-                Inr id)
-           ids)
-    in
-    lwt new_datas = make ids in
-    List.iter
-      (fun data ->
-         let weak = Weak.create 1 in
-         Weak.set weak 0 (Some data);
-         Table.add cache data#id weak;
-         Gc.finalise (finalise cache data#id) data)
-      new_datas;
-    return (old_datas @ new_datas)
-end
-
-(* +-----------------------------------------------------------------+
-   | Structures                                                      |
-   +-----------------------------------------------------------------+ *)
-
-class portrait id link width height = object
-  method id : id = id
-  method link : link = link
-  method width : int = width
-  method height : int = height
-end
-
-class biography text portraits = object
-  method text : string = text
-  method portraits : portrait list = portraits
-end
-
-class restriction catalogues forbidden allowed = object
-  method catalogues : string list option = catalogues
-  method forbidden : string list option = forbidden
-  method allowed : string list option = allowed
-end
-
-class similar_artist id link name portrait genres years_active restrictions = object
-  method id : id = id
-  method link : link = link
-  method name : string = name
-  method portrait : id option = portrait
-  method genres : string list = genres
-  method years_active : int list = years_active
-  method restrictions : restriction list = restrictions
-end
-
-class file id format bitrate = object
-  method id : id = id
-  method format : string = format
-  method bitrate : int = bitrate
-end
-
-class alternative id link files restrictions = object
-  method id : id = id
-  method link : link = link
-  method files : file list = files
-  method restrictions : restriction list = restrictions
-end
-
-class track id link title explicit artists artists_id album album_id album_artist album_artist_id year number length files cover popularity external_ids alternatives  = object
-  method id : id = id
-  method link : link = link
-  method title : string = title
-  method explicit : bool = explicit
-  method artists : string list = artists
-  method artists_id : id list = artists_id
-  method album : string = album
-  method album_id : id = album_id
-  method album_artist : string = album_artist
-  method album_artist_id : id = album_artist_id
-  method year : int = year
-  method number : int = number
-  method length : float = length
-  method files : file list = files
-  method cover : id option = cover
-  method popularity : float = popularity
-  method external_ids : (string * string) list = external_ids
-  method alternatives : alternative list = alternatives
-end
-
-class disc number name tracks = object
-  method number : int = number
-  method name : string option = name
-  method tracks : id list = tracks
-end
-
-class album id link name artist artist_id album_type year cover copyrights restrictions external_ids discs = object
-  method id : id = id
-  method link : link = link
-  method name : string = name
-  method artist : string = artist
-  method artist_id : id = artist_id
-  method album_type : string = album_type
-  method year : int = year
-  method cover : id option = cover
-  method copyrights : (string * string) list = copyrights
-  method restrictions : restriction list = restrictions
-  method external_ids : (string * string) list = external_ids
-  method discs : disc list = discs
-end
-
-class artist id link name portrait biographies similar_artists genres years_active albums = object
-  method id : id = id
-  method link : link = link
-  method name : string = name
-  method portrait : portrait option = portrait
-  method biographies : biography list = biographies
-  method similar_artists : similar_artist list = similar_artists
-  method genres : string list = genres
-  method years_active : int list = years_active
-  method albums : id list = albums
-end
-
-class artist_search id link name portrait popularity restrictions = object
-  method id : id = id
-  method link : link = link
-  method name : string = name
-  method portrait : portrait option = portrait
-  method popularity : float = popularity
-  method restrictions : restriction list = restrictions
-end
-
-class album_search id link name artist artist_id cover popularity restrictions external_ids = object
-  method id : id = id
-  method link : link = link
-  method name : string = name
-  method artist : string = artist
-  method artist_id : id = artist_id
-  method cover : id option = cover
-  method popularity : float = popularity
-  method restrictions : restriction list = restrictions
-  method external_ids : (string * string) list = external_ids
-end
-
-class simple_search_result link did_you_mean total_artists total_albums total_tracks = object
-  method link : link = link
-  method did_you_mean : string option = did_you_mean
-  method total_artists : int = total_artists
-  method total_albums : int = total_albums
-  method total_tracks : int = total_tracks
-end
-
-class search_result link did_you_mean total_artists total_albums total_tracks artists albums tracks = object
-  method link : link = link
-  method did_you_mean : string option = did_you_mean
-  method total_artists : int = total_artists
-  method total_albums : int = total_albums
-  method total_tracks : int = total_tracks
-  method artists : artist_search list = artists
-  method albums : album_search list = albums
-  method tracks : track list = tracks
-end
-
-(* +-----------------------------------------------------------------+
-   | Writers                                                         |
-   +-----------------------------------------------------------------+ *)
-
-let write_portrait oc (portrait : portrait) =
-  XML.write_node oc "portrait" []
-    (fun oc ->
-       lwt () = XML.write_data oc "id" (string_of_id portrait#id) in
-       lwt () = XML.write_data oc "width" (string_of_int portrait#width) in
-       lwt () = XML.write_data oc "height" (string_of_int portrait#height) in
-       return ())
-
-let write_biography oc (bio : biography) =
-  XML.write_node oc "bio" []
-    (fun oc ->
-       lwt () = XML.write_data oc "text" bio#text in
-       lwt () = XML.write_nodes oc "portraits" write_portrait bio#portraits in
-       return ())
-
-let write_restriction oc (restriction : restriction) =
-  let attrs = [] in
-  let attrs = match restriction#allowed with Some l -> ("allowed", String.concat "," l) :: attrs | None -> attrs in
-  let attrs = match restriction#forbidden with Some l -> ("forbidden", String.concat "," l) :: attrs | None -> attrs in
-  let attrs = match restriction#catalogues with Some l -> ("catalogues", String.concat "," l) :: attrs | None -> attrs in
-  XML.write_empty_node oc "restriction" attrs
-
-let write_similar_artist oc (similar_artist : similar_artist) =
-  XML.write_node oc "similar-artist" []
-    (fun oc ->
-       lwt () = XML.write_data oc "id" (string_of_id similar_artist#id) in
-       lwt () = XML.write_data oc "name" similar_artist#name in
-       lwt () = match similar_artist#portrait with Some x -> XML.write_data oc "portrait" (string_of_id x) | None -> return () in
-       lwt () = XML.write_data oc "genres" (String.concat "," similar_artist#genres) in
-       lwt () = XML.write_data oc "years-active" (String.concat "," (List.map string_of_int similar_artist#years_active)) in
-       lwt () = XML.write_nodes oc "restrictions" write_restriction similar_artist#restrictions in
-       return ())
-
-let write_file oc file =
-  XML.write_empty_node oc "file" [("id", string_of_id file#id); ("format", Printf.sprintf "%s,%d" file#format file#bitrate)]
-
-let write_alternative oc (alternative : alternative) =
-  XML.write_node oc "track" []
-    (fun oc ->
-       lwt () = XML.write_data oc "id" (string_of_id alternative#id) in
-       lwt () = XML.write_nodes oc "files" write_file alternative#files in
-       lwt () = XML.write_nodes oc "restrictions" write_restriction alternative#restrictions in
-       return ())
-
-let write_external_id oc (t, i) =
-  XML.write_empty_node oc "external-id" [("type", t); ("id", i)]
-
-let write_track oc (track : track) =
-  XML.write_node oc "track" []
-    (fun oc ->
-       lwt () = XML.write_data oc "mlspot-cache-version" (string_of_int track_cache_version) in
-       lwt () = XML.write_data oc "id" (string_of_id track#id) in
-       lwt () = XML.write_data oc "title" track#title in
-       lwt () = XML.write_data oc "explicit" (string_of_bool track#explicit) in
-       lwt () = Lwt_list.iter_s (XML.write_data oc "artist") track#artists in
-       lwt () = Lwt_list.iter_s (XML.write_data oc "artist-id") (List.map string_of_id track#artists_id) in
-       lwt () = XML.write_data oc "album" track#album in
-       lwt () = XML.write_data oc "album-id" (string_of_id track#album_id) in
-       lwt () = XML.write_data oc "album-artist" track#album_artist in
-       lwt () = XML.write_data oc "album-artist-id" (string_of_id track#album_artist_id) in
-       lwt () = XML.write_data oc "track-number" (string_of_int track#number) in
-       lwt () = XML.write_data oc "length" (string_of_int (int_of_float (track#length *. 1000.))) in
-       lwt () = XML.write_nodes oc "files" write_file track#files in
-       lwt () = match track#cover with Some id -> XML.write_data oc "cover" (string_of_id id) | None -> return () in
-       lwt () = XML.write_data oc "year" (string_of_int track#year) in
-       lwt () = XML.write_data oc "popularity" (string_of_float track#popularity) in
-       lwt () = XML.write_nodes oc "external-ids" write_external_id track#external_ids in
-       lwt () = XML.write_nodes oc "alternatives" write_alternative track#alternatives in
-       return ())
-
-let write_track_id oc id =
-  XML.write_data oc "track" (string_of_id id)
-
-let write_disc oc disc =
-  XML.write_node oc "disc" []
-    (fun oc ->
-       lwt () = XML.write_data oc "disc-number" (string_of_int disc#number) in
-       lwt () = match disc#name with Some name -> XML.write_data oc "name" name | None -> return () in
-       lwt () = Lwt_list.iter_s (write_track_id oc) disc#tracks in
-       return ())
-
-let write_copyright oc (kind, data) =
-  XML.write_data oc kind data
-
-let write_album oc (album : album) =
-  XML.write_node oc "album" []
-    (fun oc ->
-       lwt () = XML.write_data oc "mlspot-cache-version" (string_of_int album_cache_version) in
-       lwt () = XML.write_data oc "id" (string_of_id album#id) in
-       lwt () = XML.write_data oc "name" album#name in
-       lwt () = XML.write_data oc "artist" album#artist in
-       lwt () = XML.write_data oc "artist-id" (string_of_id album#artist_id) in
-       lwt () = XML.write_data oc "album-type" album#album_type in
-       lwt () = XML.write_data oc "year" (string_of_int album#year) in
-       lwt () = match album#cover with Some id -> XML.write_data oc "cover" (string_of_id id) | None -> return () in
-       lwt () = XML.write_nodes oc "copyright" write_copyright album#copyrights in
-       lwt () = XML.write_nodes oc "restrictions" write_restriction album#restrictions in
-       lwt () = XML.write_nodes oc "external-ids" write_external_id album#external_ids in
-       lwt () = XML.write_nodes oc "discs" write_disc album#discs in
-       return ())
-
-let write_album_id oc id =
-  XML.write_data oc "album" (string_of_id id)
-
-let write_artist oc (artist : artist) =
-  XML.write_node oc "artist" []
-    (fun oc ->
-       lwt () = XML.write_data oc "mlspot-cache-version" (string_of_int artist_cache_version) in
-       lwt () = XML.write_data oc "id" (string_of_id artist#id) in
-       lwt () = XML.write_data oc "name" artist#name in
-       lwt () = match artist#portrait with Some portrait -> write_portrait oc portrait | None -> return () in
-       lwt () = XML.write_nodes oc "bios" write_biography artist#biographies in
-       lwt () = XML.write_nodes oc "similar-artists" write_similar_artist artist#similar_artists in
-       lwt () = XML.write_data oc "genres" (String.concat "," artist#genres) in
-       lwt () = XML.write_data oc "years-active" (String.concat "," (List.map string_of_int artist#years_active)) in
-       lwt () = XML.write_nodes oc "albums" write_album_id artist#albums in
-       return ())
 
 (* +-----------------------------------------------------------------+
    | Saving to the cache                                             |
@@ -3429,6 +2960,618 @@ class search_result_parser session query assign = object
     assign (new search_result (Search query) did_you_mean total_artists total_albums total_tracks artists albums tracks)
 end
 
+class playlist_ops_parser assign = object
+  inherit xml_parser
+
+  val mutable name = ""
+  val mutable tracks = []
+
+  method node tag attrs =
+    match tag with
+      | "name" -> new data (fun x -> name <- x)
+      | "add" -> new node "items" (fun attrs -> new data (fun x -> tracks <- List.map (fun str -> id_of_string (String.sub str 0 32))  (split ',' (strip x))))
+      | _ -> new xml_parser
+
+  method stop =
+    assign (name, tracks)
+end
+
+class playlist_change_parser assign = object
+  inherit xml_parser
+
+  val mutable name = ""
+  val mutable user = ""
+  val mutable time = 0.
+  val mutable tracks = []
+
+  method node tag attrs =
+    match tag with
+      | "ops" -> new playlist_ops_parser (fun (name', tracks') -> name <- name'; tracks <- tracks')
+      | "time" -> new data (fun x -> time <- float_of_string x)
+      | "user" -> new data (fun x -> user <- x)
+      | _ -> new xml_parser
+
+  method stop =
+    assign (name, user, time, tracks)
+end
+
+class playlist_parser id assign = object
+  inherit xml_parser
+
+  val mutable name = ""
+  val mutable user = ""
+  val mutable time = 0.
+  val mutable revision = 0
+  val mutable checksum = 0
+  val mutable collaborative = false
+  val mutable tracks = []
+
+  method node tag attrs =
+    match tag with
+      | "change" -> new playlist_change_parser (fun (name', user', time', tracks') ->
+                                                  name <- name';
+                                                  user <- user';
+                                                  time <- time';
+                                                  tracks <- tracks')
+      | "version" -> new data (fun x ->
+                                 match split ',' x with
+                                   | [revision'; num_tracks'; checksum'; collaborative'] ->
+                                       revision <- int_of_string revision';
+                                       checksum <- int_of_string checksum';
+                                       collaborative <- int_of_string collaborative' <> 0
+                                   | _ ->
+                                       failwith "invalid playlist version")
+      | _ -> new xml_parser
+
+  method stop =
+    assign (new playlist id (Playlist (user, id)) name user time revision checksum collaborative tracks)
+end
+
+(* +-----------------------------------------------------------------+
+   | Dispatching                                                     |
+   +-----------------------------------------------------------------+ *)
+
+let dispatch sp command payload =
+  if debug then delay (save_raw_data (string_of_command command) payload);
+  match command with
+    | CMD_SECRET_BLOCK ->
+        send_packet sp CMD_CACHE_HASH "\xf4\xc2\xaa\x05\xe8\x25\xa7\xb5\xe4\xe6\x59\x0f\x3d\xd0\xbe\x0a\xef\x20\x51\x95"
+
+    | CMD_PING ->
+        send_packet sp CMD_PONG "\x00\x00\x00\x00"
+
+    | CMD_PONG_ACK ->
+        return ()
+
+    | CMD_WELCOME ->
+        wakeup sp.login_wakener ();
+        return ()
+
+    | CMD_PROD_INFO -> begin
+        let cell = ref None in
+        let products = XML.parse_string cell (new products_parser (fun x -> cell := Some x)) payload in
+        try
+          sp.set_products products;
+          return ()
+        with exn ->
+          ignore (Lwt_log.error ~section ~exn "failed to set products informations");
+          return ()
+      end
+
+    | CMD_COUNTRY_CODE -> begin
+        try
+          sp.set_country_code payload;
+          return ()
+        with exn ->
+          ignore (Lwt_log.error ~section ~exn "failed to set the country code");
+          return ()
+      end
+
+    | CMD_CHANNEL_DATA ->
+        if String.length payload < 2 then
+          Lwt_log.error ~section "invalid channel data received"
+        else begin
+          (* Read the channel id. *)
+          let id = get_int16 payload 0 in
+          match try Some (Channel_map.find id sp.channels) with Not_found -> None with
+            | None ->
+                Lwt_log.error ~section "channel data from unknown channel received"
+
+            | Some channel ->
+                if String.length payload = 2 then begin
+                  (* End of channel. *)
+                  release_channel sp id;
+                  channel.ch_done <- true;
+                  Lwt_condition.signal channel.ch_cond ();
+                  return ()
+                end else begin
+                  Queue.add (payload, 2, String.length payload - 2) channel.ch_data;
+                  Lwt_condition.signal channel.ch_cond ();
+                  return ()
+                end
+        end
+
+    | CMD_CHANNEL_ERROR ->
+        if String.length payload < 2 then
+          Lwt_log.error ~section "invalid channel error received"
+        else begin
+          (* Read the channel id. *)
+          let id = get_int16 payload 0 in
+          match try Some (Channel_map.find id sp.channels) with Not_found -> None with
+            | None ->
+                Lwt_log.error ~section "channel error from unknown channel received"
+
+            | Some channel ->
+                release_channel sp id;
+                wakeup_exn channel.ch_error_wakener (Error "channel error");
+                return ()
+        end
+
+    | CMD_AES_KEY ->
+        if String.length payload < 4 then
+          Lwt_log.error ~section "invalid AES key received"
+        else begin
+          let id = get_int16 payload 2 in
+          match try Some (Channel_map.find id sp.channels) with Not_found -> None with
+            | None ->
+                Lwt_log.error ~section "AES key from unknown channel received"
+
+            | Some channel ->
+                release_channel sp id;
+                Queue.add (payload, 4, String.length payload - 4) channel.ch_data;
+                channel.ch_done <- true;
+                Lwt_condition.signal channel.ch_cond ();
+                return ()
+        end
+
+    | CMD_AES_KEY_ERROR ->
+        if String.length payload < 4 then
+          Lwt_log.error ~section "invalid AES key error received"
+        else begin
+          let id = get_int16 payload 2 in
+          match try Some (Channel_map.find id sp.channels) with Not_found -> None with
+            | None ->
+                Lwt_log.error ~section "AES key error from unknown channel received"
+
+            | Some channel ->
+                release_channel sp id;
+                wakeup_exn channel.ch_error_wakener (Error "key error");
+                return ()
+        end
+
+    | CMD_PLAYLIST_CHANGED ->
+        if String.length payload <> 17 then
+          Lwt_log.error ~section "invalid playlist notification received"
+        else begin
+          let id = ID.of_bytes (String.sub payload 0 16) in
+          match try Some (ID_table.find sp.playlists id) with Not_found -> None with
+            | Some (notify, weak) ->
+                notify ();
+                return ()
+            | None ->
+                return ()
+        end
+
+    | _ ->
+        Lwt_log.info_f ~section "do not know what to do with command '%s'" (string_of_command command)
+
+let disconnect sp =
+  if not sp.disconnected then begin
+    sp.disconnected <- true;
+    wakeup_exn sp.logout_wakener Disconnected;
+    try_lwt
+      Lwt_io.flush sp.oc
+    finally
+      Lwt_unix.shutdown sp.socket Unix.SHUTDOWN_ALL;
+      Lwt_unix.close sp.socket
+  end else
+    return ()
+
+let rec loop_dispatch sp =
+  lwt continue =
+    try_lwt
+      lwt command, payload = recv_packet sp in
+      ignore (
+        try_lwt
+          dispatch sp command payload
+        with exn ->
+          Lwt_log.error ~section ~exn "dispatcher failed with"
+      );
+      return true
+    with
+      | Unknown_command command ->
+          ignore (Lwt_log.error_f ~section "unknown command received (0x%02x)" command);
+          return true
+      | Logged_out | Disconnected ->
+          return false
+      | End_of_file ->
+          lwt () = disconnect sp in
+          return false
+      | exn ->
+          ignore (Lwt_log.error ~section ~exn "command reader failed with");
+          lwt () = disconnect sp in
+          return false
+  in
+  if continue then
+    loop_dispatch sp
+  else
+    return ()
+
+(* +-----------------------------------------------------------------+
+   | Loggin/logout                                                   |
+   +-----------------------------------------------------------------+ *)
+
+exception Connection_failure of string
+
+let dh_parameters = {
+  Cryptokit.DH.p = "\
+\xff\xff\xff\xff\xff\xff\xff\xff\xc9\x0f\xda\xa2\x21\x68\xc2\x34\
+\xc4\xc6\x62\x8b\x80\xdc\x1c\xd1\x29\x02\x4e\x08\x8a\x67\xcc\x74\
+\x02\x0b\xbe\xa6\x3b\x13\x9b\x22\x51\x4a\x08\x79\x8e\x34\x04\xdd\
+\xef\x95\x19\xb3\xcd\x3a\x43\x1b\x30\x2b\x0a\x6d\xf2\x5f\x14\x37\
+\x4f\xe1\x35\x6d\x6d\x51\xc2\x45\xe4\x85\xb5\x76\x62\x5e\x7e\xc6\
+\xf4\x4c\x42\xe9\xa6\x3a\x36\x20\xff\xff\xff\xff\xff\xff\xff\xff";
+  Cryptokit.DH.g = "\x02";
+  Cryptokit.DH.privlen = 160;
+}
+
+let key = "\
+\xae\xd6\xb1\xf6\xf2\x67\x44\xdb\xf1\x79\x85\x30\xc9\xfc\xcc\x35\
+\xb0\x86\x81\x0d\x1d\x87\x2f\x0f\xba\xa8\xbe\x71\x7a\x43\xac\xc6\
+\xd3\x73\x88\x2c\xdf\x3b\x6e\x96\x56\xae\x8b\x18\x93\x56\x77\xb1\
+\xa0\xe0\x4e\xea\xa7\xea\x1d\xbd\xb1\xc5\x95\xb4\x30\xc3\x31\xf1\
+\x57\x4f\x0e\xb8\xc8\x3a\xd6\xb3\x9a\xab\x71\xdc\xbb\x3b\x4d\xb9\
+\x84\x31\x65\x18\x79\x13\x73\xe8\xa6\xe3\xc8\x9b\x56\xcf\x25\x8e\
+\x49\x83\x2d\xe1\x84\xcd\xd4\x5d\x06\xe4\x41\x99\xc7\x0b\x37\x5c\
+\x08\x3e\xdc\x86\x8d\xb0\x21\xbe\xc1\x53\xcb\xf8\xcc\x4f\x40\x13"
+
+let logout session =
+  match session#get_session_parameters with
+    | None ->
+        return ()
+    | Some sp ->
+        session#set_session_parameters None;
+        disconnect sp
+
+let login session ~username ~password =
+  lwt () = logout session in
+
+  lwt socket =
+    try_lwt
+      (* Service lookup. *)
+      lwt servers =
+        try_lwt
+          service_lookup ()
+        with Unix.Unix_error (error, _, _) ->
+          ignore (Lwt_log.warning_f ~section "service lookup failed: %s" (Unix.error_message error));
+          return [(0, "ap.spotify.com", 4070)]
+      in
+
+      (* Sort servers. *)
+      let servers = List.sort (fun (prio1, _, _) (prio2, _, _) -> prio1 - prio2) servers in
+
+      (* Read address informations. *)
+      lwt address_infos =
+        Lwt_list.map_p
+          (fun (priority, host, port) ->
+             Lwt_unix.getaddrinfo host (string_of_int port) [Unix.AI_SOCKTYPE Unix.SOCK_STREAM; Unix.AI_PROTOCOL 0])
+          servers
+        >|= List.flatten
+      in
+
+      (* Try to connect to a server. *)
+      let rec loop address_infos =
+        match address_infos with
+          | [] ->
+              raise_lwt (Connection_failure "no server available")
+          | address_info :: address_infos ->
+              let sock = Lwt_unix.socket address_info.Unix.ai_family address_info.Unix.ai_socktype address_info.Unix.ai_protocol in
+              try_lwt
+                (* Try to connect. *)
+                lwt () = Lwt_unix.connect sock address_info.Unix.ai_addr in
+                return sock
+              with Unix.Unix_error _ ->
+                lwt () = Lwt_unix.close sock in
+                (* Try other addresses. *)
+                loop address_infos
+      in
+
+      loop address_infos
+
+    with Unix.Unix_error (error, _, _) ->
+      raise_lwt (Connection_failure (Unix.error_message error))
+  in
+
+  try_lwt
+    let ic = Lwt_io.make ~mode:Lwt_io.input (Lwt_bytes.read socket)
+    and oc = Lwt_io.make ~mode:Lwt_io.output (Lwt_bytes.write socket) in
+
+    (* Create a new random number generator.
+       [Cryptokit.Random.secure_rng] is far two slow, so we get some
+       random random bytes from /dev/random and complete with pseudo
+       random data. *)
+    let random = String.create 55 in
+    let offset =
+      try
+        let fd = Unix.openfile "/dev/random" [Unix.O_RDONLY; Unix.O_NONBLOCK] 0 in
+        begin
+          try
+            let offset = Unix.read fd random 0 (String.length random) in
+            Unix.close fd;
+            ignore (Lwt_log.info_f ~section "%d random bytes read from /dev/random" offset);
+            offset
+          with _ ->
+            ignore (Lwt_log.info_f ~section "0 random bytes read from /dev/random");
+            Unix.close fd;
+            0
+        end
+      with _ ->
+        0
+    in
+    if offset < String.length random then begin
+      let state = Random.State.make_self_init () in
+      for i = offset to String.length random - 1 do
+        random.[i] <- Char.unsafe_chr (Random.State.int state 256)
+      done;
+    end;
+
+    (* Create the random number generator. *)
+    let rng = Cryptokit.Random.pseudo_rng random in
+
+    (* Generate random data. *)
+    let client_random = Cryptokit.Random.string rng 16 in
+
+    (* Generate a secret. *)
+    let secret = Cryptokit.DH.private_secret ~rng dh_parameters in
+
+    (* Forge the initial packet. *)
+    let packet = Packet.create () in
+
+    (* Protocol version. *)
+    Packet.add_int16 packet 3;
+    (* Packet length, updated later. *)
+    Packet.add_int16 packet 0;
+    (* Unknown. *)
+    Packet.add_int32 packet 0x00000300;
+    (* Unknown. *)
+    Packet.add_int32 packet 0x00030c00;
+    (* Client revision. *)
+    Packet.add_int32 packet 99999;
+    (* Unknown. *)
+    Packet.add_int32 packet 0;
+    (* Unknown. *)
+    Packet.add_int32 packet 0x01000000;
+    (* Client ID. *)
+    Packet.add_int32 packet 0x01040101;
+    (* Unknown. *)
+    Packet.add_int32 packet 0;
+    (* Random data. *)
+    Packet.add_string packet client_random;
+    (* DH message. *)
+    Packet.add_string packet (Cryptokit.DH.message dh_parameters secret);
+    (* RSA modulus. *)
+    Packet.add_string packet key;
+    (* Length of random data. *)
+    Packet.add_int8 packet 0;
+    Packet.add_int8 packet (String.length username);
+    (* Unknown. *)
+    Packet.add_int16 packet 0x0100;
+    (* <-- random data would go here *)
+    Packet.add_string packet username;
+    (* Unknown. *)
+    Packet.add_int8 packet 0x40;
+    (* Update length bytes. *)
+    Packet.put_int16 packet 2 (Packet.length packet);
+
+    (* Save the initial client packet. *)
+    let init_client = Packet.contents packet in
+
+    (* Send the packet. *)
+    lwt () = Packet.send oc packet in
+    lwt () = Lwt_io.flush oc in
+
+    Packet.reset packet;
+
+    let server_random = String.create 16 in
+
+    (* Read 2 status bytes. *)
+    lwt () = Lwt_io.read_into_exactly ic server_random 0 2 in
+
+    if server_random.[0] <> '\x00' then begin
+      match Char.code server_random.[1] with
+        | 0x01 -> raise (Authentication_failure "client upgrade recquired")
+        | 0x03 -> raise (Authentication_failure "user not found")
+        | 0x04 -> raise (Authentication_failure "account has been disabled")
+        | 0x06 -> raise (Authentication_failure "you need to complete your account details")
+        | 0x09 -> raise (Authentication_failure "country mismatch")
+        | code -> raise (Authentication_failure (Printf.sprintf "unknown error (%d)" code))
+    end;
+
+    (* Read remaining 14 random bytes. *)
+    lwt () = Lwt_io.read_into_exactly ic server_random 2 14 in
+    Packet.add_string packet server_random;
+
+    let public_key = String.create 96 in
+    lwt () = Lwt_io.read_into_exactly ic public_key 0 96 in
+    Packet.add_string packet public_key;
+
+    let blob = String.create 256 in
+    lwt () = Lwt_io.read_into_exactly ic blob 0 256 in
+    Packet.add_string packet blob;
+
+    let salt = String.create 10 in
+    lwt () = Lwt_io.read_into_exactly ic salt 0 10 in
+    Packet.add_string packet salt;
+
+    lwt padding_length = Lwt_io.read_char ic >|= Char.code in
+    Packet.add_int8 packet padding_length;
+    lwt username_length = Lwt_io.read_char ic >|= Char.code in
+    Packet.add_int8 packet username_length;
+    let puzzle_length = ref 0 in
+    lwt () =
+      for_lwt i = 0 to 3 do
+        lwt len0 = Lwt_io.read_char ic >|= Char.code in
+        lwt len1 = Lwt_io.read_char ic >|= Char.code in
+        Packet.add_int8 packet len0;
+        Packet.add_int8 packet len1;
+        puzzle_length := !puzzle_length + ((len0 lsl 8) lor len1);
+        return ()
+      done
+    in
+
+    let padding = String.create padding_length in
+    lwt () = Lwt_io.read_into_exactly ic padding 0 padding_length in
+    Packet.add_string packet padding;
+
+    let username = String.create username_length in
+    lwt () = Lwt_io.read_into_exactly ic username 0 username_length in
+    Packet.add_string packet username;
+
+    let puzzle = String.create !puzzle_length in
+    lwt () = Lwt_io.read_into_exactly ic puzzle 0 !puzzle_length in
+    Packet.add_string packet puzzle;
+
+    (* Save the initial server packet. *)
+    let init_server = Packet.contents packet in
+
+    if String.length puzzle < 6 || puzzle.[0] <> '\x01' then
+      raise (Authentication_failure "unexpected puzzle challenge");
+    let denominator = 1 lsl (Char.code puzzle.[1]) - 1 in
+    let magic = get_int32 puzzle 2 in
+
+    (* Compute the shared secret. *)
+    let shared_secret = Cryptokit.DH.shared_secret dh_parameters secret public_key in
+
+    (* Hash of the salt and the password. *)
+    let ctx = Cryptokit.Hash.sha1 () in
+    ctx#add_string salt;
+    ctx#add_char ' ';
+    ctx#add_string password;
+    let auth_hash = ctx#result in
+
+    let message = auth_hash ^ client_random ^ server_random ^ "\x00" in
+
+    let hmac_output = String.create (20 * 5) in
+    for i = 1 to 5 do
+      message.[52] <- char_of_int i;
+      let ctx = Cryptokit.MAC.hmac_sha1 shared_secret in
+      ctx#add_string message;
+      let hmac = ctx#result in
+      String.blit hmac 0 hmac_output ((i - 1) * 20) 20;
+      String.blit hmac 0 message 0 20
+    done;
+
+    let shn_send = shn_ctx_new () in
+    let shn_recv = shn_ctx_new () in
+    shn_key shn_send hmac_output 20 32;
+    shn_key shn_recv hmac_output 52 32;
+
+    let key_hmac = String.sub hmac_output 0 20 in
+
+    (* Solve the puzzle. *)
+    let solution = String.create 8 in
+    Random.self_init ();
+    let rec loop () =
+      let ctx = Cryptokit.Hash.sha1 () in
+      ctx#add_string server_random;
+      for i = 0 to 7 do
+        solution.[i] <- char_of_int (Random.int 256)
+      done;
+      ctx#add_string solution;
+      let digest = ctx#result in
+      let nominator = get_int32 digest 16 in
+      if (nominator lxor magic) land denominator <> 0 then loop ()
+    in
+    loop ();
+
+    Packet.reset packet;
+    Packet.add_string packet init_client;
+    Packet.add_string packet init_server;
+    (* Random data length. *)
+    Packet.add_int8 packet 0;
+    (* Unknown. *)
+    Packet.add_int8 packet 0;
+    (* Puzzle solution length. *)
+    Packet.add_int16 packet 8;
+    (* Unknown. *)
+    Packet.add_int32 packet 0;
+    (* <-- random data would go here. *)
+    Packet.add_string packet solution;
+
+    let ctx = Cryptokit.MAC.hmac_sha1 key_hmac in
+    ctx#add_substring (Packet.buffer packet) 0 (Packet.length packet);
+    let auth_hmac = ctx#result in
+
+    (* Forge the authentication packet. *)
+    Packet.reset packet;
+
+    Packet.add_string packet auth_hmac;
+    (* Random data length. *)
+    Packet.add_int8 packet 0;
+    (* Unknown. *)
+    Packet.add_int8 packet 0;
+    (* Puzzle solution length. *)
+    Packet.add_int16 packet 8;
+    (* Unknown. *)
+    Packet.add_int32 packet 0;
+    (* <-- random data would go here. *)
+    Packet.add_string packet solution;
+
+    (* Send the packet. *)
+    lwt () = Packet.send oc packet in
+
+    (* Read the response. *)
+    lwt status = Lwt_io.read_char ic >|= Char.code in
+    if status <> 0 then raise (Authentication_failure "authentication failed");
+
+    (* Read the payload length. *)
+    lwt payload_length = Lwt_io.read_char ic >|= Char.code in
+
+    (* Read the payload. *)
+    let payload = String.create payload_length in
+    lwt () = Lwt_io.read_into_exactly ic payload 0 payload_length in
+
+    let login_waiter, login_wakener = task () in
+    let logout_waiter, logout_wakener = wait () in
+    let sp = {
+      disconnected = false;
+      socket;
+      ic;
+      oc;
+      shn_send;
+      shn_recv;
+      send_iv = 0;
+      recv_iv = 0;
+      channels = Channel_map.empty;
+      next_channel_id = 0;
+      channel_released = Lwt_condition.create ();
+      login_waiter;
+      login_wakener;
+      logout_waiter;
+      logout_wakener;
+      set_products = session#set_products;
+      set_country_code = session#set_country_code;
+      playlists = ID_table.create 32;
+    } in
+
+    (* Start the dispatcher. *)
+    ignore (loop_dispatch sp);
+
+    try_lwt
+      lwt () = login_waiter in
+      session#set_session_parameters (Some sp);
+      return ()
+
+    with exn ->
+      (* Make sure the dispatcher exit. *)
+      wakeup_exn logout_wakener Logged_out;
+      raise_lwt exn
+
+  with exn ->
+    Lwt_unix.shutdown socket Unix.SHUTDOWN_ALL;
+    lwt () = Lwt_unix.close socket in
+    raise_lwt exn
+
 (* +-----------------------------------------------------------------+
    | Commands                                                        |
    +-----------------------------------------------------------------+ *)
@@ -3581,6 +3724,53 @@ let search_callbacks session ?(offset = 0) ?(length = 1000) ?(artist = ignore) ?
   lwt stream = save_debug_stream "search result" stream in
   let cell = ref None in
   XML.parse_stream cell (new node "result" (fun attrs -> new search_result_callbacks_parser session query artist album track (fun x -> cell := Some x))) (new inflate_stream stream)
+
+(* +-----------------------------------------------------------------+
+   | Playlists                                                       |
+   +-----------------------------------------------------------------+ *)
+
+let remove_playlist session id () =
+  match session#get_session_parameters with
+    | Some sp ->
+        ID_table.remove sp.playlists id
+    | None ->
+        ()
+
+let fetch_playlist session id =
+  lwt channel_id, stream = alloc_channel session#session_parameters in
+  let packet = Packet.create () in
+  Packet.add_int16 packet channel_id;
+  Packet.add_string packet (ID.to_bytes id);
+  Packet.add_int8 packet 2;
+  Packet.add_int16 packet 0xffff;
+  Packet.add_int16 packet 0xffff;
+  Packet.add_int32 packet 0;
+  Packet.add_int16 packet 0xffff;
+  Packet.add_int16 packet 0xffff;
+  Packet.add_int8 packet 1;
+  lwt () = send_packet session#session_parameters CMD_GET_DATA_PLAYLIST (Packet.contents packet) in
+  lwt stream = save_debug_stream "playlist" stream in
+  let cell = ref None in
+  XML.parse_stream ~buggy_root:true cell (new node "next-change" (fun attrs -> new playlist_parser id (fun x -> cell := Some x))) stream
+
+let get_playlist session id =
+  if id_length id <> 16 then raise (Wrong_id "playlist");
+  match try Weak.get (snd (ID_table.find session#session_parameters.playlists id)) 0 with Not_found -> None with
+    | Some signal ->
+        return signal
+    | None ->
+        lwt playlist = fetch_playlist session id in
+        let sp = session#session_parameters in
+        match try Weak.get (snd (ID_table.find sp.playlists id)) 0 with Not_found -> None with
+          | Some signal ->
+              return signal
+          | None ->
+              let ev, notify = E.create () in
+              let signal = S.with_finaliser (remove_playlist session id) (S.hold playlist (E.map_s (fun () -> fetch_playlist session id) ev)) in
+              let weak = Weak.create 1 in
+              Weak.set weak 0 (Some signal);
+              ID_table.add sp.playlists id (notify, weak);
+              return signal
 
 (* +-----------------------------------------------------------------+
    | Data fetching                                                   |

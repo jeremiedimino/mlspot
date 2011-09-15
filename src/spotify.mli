@@ -336,6 +336,25 @@ val search_callbacks : session -> ?offset : int -> ?length : int -> ?artist : (a
       - [track] is called on all track found.
   *)
 
+(** {6 Playlists} *)
+
+class type playlist = object
+  method id : id
+  method link : link
+  method name : string
+  method user : string
+  method time : float
+  method revision : int
+  method checksum : int
+  method collaborative : bool
+  method tracks : id list
+end
+
+val get_playlist : session -> id -> playlist React.signal Lwt.t
+  (** [get_playlist session id] returns the playlist whose id is
+      [id]. [id] must be of length 16. The playlist may change over
+      the time. *)
+
 (** {6 Streams} *)
 
 type stream

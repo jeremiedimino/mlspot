@@ -156,16 +156,16 @@ class type biography = object
 end
 
 class type restriction = object
-  method catalogues : string list
-  method forbidden : string list
-  method allowed : string list
+  method catalogues : string list option
+  method forbidden : string list option
+  method allowed : string list option
 end
 
 class type similar_artist = object
   method id : id
   method link : link
   method name : string
-  method portrait : id
+  method portrait : id option
   method genres : string list
   method years_active : int list
   method restrictions : restriction list
@@ -208,7 +208,7 @@ end
 class type disc = object
   method number : int
   method name : string option
-  method tracks : track list
+  method tracks : id list
 end
 
 class type album = object
@@ -230,12 +230,12 @@ class type artist = object
   method id : id
   method link : link
   method name : string
-  method portrait : portrait
+  method portrait : portrait option
   method biographies : biography list
   method similar_artists : similar_artist list
   method genres : string list
   method years_active : int list
-  method albums : album list
+  method albums : id list
 end
 
 class type artist_search = object
@@ -259,7 +259,7 @@ class type album_search = object
   method external_ids : (string * string) list
 end
 
-class type search_result = object
+class type simple_search_result = object
   method link : link
     (** Link to the search. *)
 
@@ -274,6 +274,10 @@ class type search_result = object
 
   method total_tracks : int
     (** The total number of tracks that match the query. *)
+end
+
+class type search_result = object
+  inherit simple_search_result
 
   method artists : artist_search list
   method albums : album_search list
@@ -315,7 +319,22 @@ val search : session -> ?offset : int -> ?length : int -> string -> search_resul
   (** [search session ?offset ?length query] performs the given
       search. [offset] represent the offset the first response to get
       in the list of all response. It default to [0]. [length] is the
-      maximum number of responses to return. It default to [1000]. *)
+      maximum number of responses to return. It default to [100].
+
+      Note: this function is suitable for small searches,, i.e. with a
+      small length. For large searches you should use
+      {!search_callbacks} and store only informations you need since
+      this will consume much less memory. *)
+
+val search_callbacks : session -> ?offset : int -> ?length : int -> ?artist : (artist_search -> unit) -> ?album : (album_search -> unit) -> ?track : (track -> unit) -> string -> simple_search_result Lwt.t
+  (** [search_callbacks ~session ?offset ?length ?artist ?album ?track
+      query] performs the given search using callbacks to report
+      results.
+
+      - [artist] is called on all artists found,
+      - [album] is called on all albums found,
+      - [track] is called on all track found.
+  *)
 
 (** {6 Streams} *)
 

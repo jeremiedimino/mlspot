@@ -124,6 +124,8 @@ let safe_close file fd =
    | Cache versions                                                  |
    +-----------------------------------------------------------------+ *)
 
+exception Cache_version_mismatch
+
 let artist_cache_version = 0
 let album_cache_version = 0
 let track_cache_version = 0
@@ -587,255 +589,158 @@ end
    | XML                                                             |
    +-----------------------------------------------------------------+ *)
 
-TAGS [
-  "mlspot-cache-version";
-  "id";
-  "width";
-  "height";
-  "name";
-  "genres";
-  "years-active";
-  "artist";
-  "artists";
-  "portrait";
-  "portraits";
-  "text";
-  "bio";
-  "bios";
-  "similar-artists";
-  "text";
-  "catalogues";
-  "forbidden";
-  "restriction";
-  "restrictions";
-  "artist-id";
-  "track";
-  "tracks";
-  "track-number";
-  "length";
-  "files";
-  "popularity";
-  "external-id";
-  "external-ids";
-  "format";
-  "title";
-  "file";
-  "type";
-  "disc-number";
-  "album-type";
-  "year";
-  "cover";
-  "copyright";
-  "c";
-  "p";
-  "disc";
-  "discs";
-  "similar-artist";
-  "album";
-  "albums";
-  "alternatives";
-  "allowed";
-  "explicit";
-  "artist-name";
-  "redirect";
-  "album-id";
-  "album-artist";
-  "album-artist-id";
-  "did-you-mean";
-  "total-artists";
-  "total-albums";
-  "total-tracks";
-  "result";
-  "expiry";
-  "product";
-  "products";
-]
+class xml_parser = object
+  method node (tag : string) (attrs : (string * string) list) =
+    ignore (Lwt_log.debug_f ~section "no element expected here, got %S" tag);
+    new xml_parser
 
-let rec search_tag name a b =
-  if a = b then
-    raise Not_found
-  else
-    let c = (a + b) / 2 in
-    let name' = Array.unsafe_get tags c in
-    match String.compare name name' with
-      | n when n < 0 ->
-          search_tag name a c
-      | n when n > 0 ->
-          search_tag name (c + 1) b
-      | _ ->
-          c
+  method data (str : string) =
+    ignore (Lwt_log.debug ~section "no data expected here")
 
-let make_tag name = search_tag name 0 (Array.length tags)
+  method stop =
+    ()
+end
 
-module Tag_map = Map.Make (struct
-                             type t = int
-                             let compare a b = a - b
-                           end)
+class data assign = object
+  inherit xml_parser
 
-type data = string
-    (* Type of attributes and CDATA. *)
+  val mutable data = None
 
-type node = {
-  mutable nodes : node list Tag_map.t;
-  (* Children, by tags. Children for a given tag are in reverse
-     order. *)
-  mutable datas : data list Tag_map.t;
-  (* Children containing only one CDATA, by tags as well as
-     attributes. Datas for a given tag are in reverse order. *)
-}
+  method data str =
+    match data with
+      | Some _ ->
+          ignore (Lwt_log.warning_f ~section "too many data, discarding previous one");
+          data <- Some str
+      | None ->
+          data <- Some str
 
-let empty = {
-  nodes = Tag_map.empty;
-  datas = Tag_map.empty;
-}
+  method stop =
+    match data with
+      | None ->
+          ()
+      | Some str ->
+          try
+            assign str
+          with
+            | Cache_version_mismatch as exn ->
+                raise exn
+            | exn ->
+                ignore (Lwt_log.error_f ~section ~exn "failed to parse XML data")
+end
 
-let add name elt map =
-  try
-    let tag = make_tag name in
-    try
-      Tag_map.add tag (elt :: Tag_map.find tag map) map
-    with Not_found ->
-      Tag_map.add tag [elt] map
-  with Not_found ->
-    map
+class node name f = object
+  inherit xml_parser
 
-let get_datas tag node = try List.rev (Tag_map.find tag node.datas) with Not_found -> []
-let get_nodes tag node = try List.rev (Tag_map.find tag node.nodes) with Not_found -> []
+  method node tag attrs =
+    if name = tag then
+      f attrs
+    else
+      new xml_parser
 
-let get_data tag node =
-  match Tag_map.find tag node.datas with
-    | [x] -> x
-    | _ -> raise (Error (Printf.sprintf "too many datas to unpack for tag '%s'" tags.(tag)))
+  method stop =
+    ()
+end
 
-let get_node tag node =
-  match Tag_map.find tag node.nodes with
-    | [x] -> x
-    | _ -> raise (Error (Printf.sprintf "too many nodes to unpack for tag '%s'" tags.(tag)))
+class ['a] nodes name f assign = object
+  inherit xml_parser
+
+  val mutable elements : 'a list = []
+
+  method node tag attrs =
+    if tag = name then
+      f attrs (fun x -> elements <- x :: elements)
+    else
+      new xml_parser
+
+  method stop =
+    assign (List.rev elements)
+end
 
 module XML = struct
 
+  (* +---------------------------------------------------------------+
+     | XML parsing                                                   |
+     +---------------------------------------------------------------+ *)
+
+  (* A data maker. It collects chunks of data and put them
+     together. *)
   type data_maker = {
-    mutable data_size : int;
-    mutable data_data : string list;
+    mutable data_length : int;
+    (* Length of all data in the maker. *)
+    mutable data_chunks : string list;
+    (* Chunks of data read. *)
   }
 
-  module Datas = Weak.Make (struct
-                              type t = data
-                              let equal = ( = )
-                              let hash = Hashtbl.hash
-                            end)
-
-  let data_cache = Datas.create 16384
-
-  let empty = Datas.merge data_cache ""
-
+  (* Concatanates all chunks of a data maker. *)
   let make_data dm =
-    match dm.data_data with
+    match dm.data_chunks with
       | [] ->
-          empty
+          ""
       | [str] ->
-          Datas.merge data_cache str
+          str
       | _ ->
-          let res = String.create dm.data_size in
+          let res = String.create dm.data_length in
           let rec loop ofs l =
             match l with
               | [] ->
-                  Datas.merge data_cache res
+                  (* Empty the maker for reuse. *)
+                  dm.data_length <- 0;
+                  dm.data_chunks <- [];
+                  res
               | str :: l ->
                   let len = String.length str in
                   let ofs = ofs - len in
                   String.unsafe_blit str 0 res ofs len;
                   loop ofs l
           in
-          loop dm.data_size dm.data_data
+          loop dm.data_length dm.data_chunks
 
-  type state = Undefined of string list Tag_map.t | Data of data_maker | Node of node
-
-  let is_space str =
-    let rec loop idx =
-      if idx = String.length str then
-        true
-      else
-        match String.unsafe_get str idx with
-          | ' ' | '\t' | '\n' ->
-              loop (idx + 1)
-          | _ ->
-              false
-    in
-    loop 0
-
-  let rec print indent node =
-    Tag_map.iter
-      (fun tag elts ->
-         Printf.printf "%s%s = [%s]\n" indent tags.(tag) (String.concat "; " (List.rev_map (Printf.sprintf "%S") elts)))
-      node.datas;
-    Tag_map.iter
-      (fun tag elts ->
-         List.iter
-           (fun elt ->
-              Printf.printf "%s%s = {\n" indent tags.(tag);
-              print ("  " ^ indent) elt;
-              Printf.printf "%s}\n" indent)
-           (List.rev elts))
-      node.nodes
-
-  let create_parser () =
+  let create_parser root_handler =
     let xp = Expat.parser_create None in
-    let node = { nodes = Tag_map.empty; datas = Tag_map.empty } in
     let stack = ref [] in
-    let state = ref (Node node) in
+    let handler = ref root_handler in
+    let dm = { data_length = 0; data_chunks = [] } in
     Expat.set_start_element_handler xp
       (fun name attrs ->
-         match !state with
-           | Undefined datas ->
-               stack := { nodes = Tag_map.empty; datas } :: !stack;
-               state := Undefined (List.fold_left (fun map (key, value) -> add key (Datas.merge data_cache value) map) Tag_map.empty attrs)
-           | Data str ->
-               raise (Error "cannot mix element and cdata")
-           | Node node ->
-               stack := node :: !stack;
-               state := Undefined (List.fold_left (fun map (key, value) -> add key (Datas.merge data_cache value) map) Tag_map.empty attrs));
+         (* Handle remaining data. *)
+         if dm.data_length > 0 then !handler#data (make_data dm);
+         (* Push the current handler to the stack. *)
+         stack := !handler :: !stack;
+         (* Create a new handler for the sub-node. *)
+         handler := !handler#node name attrs);
     Expat.set_end_element_handler xp
       (fun name ->
-         let node =
-           match !stack with
-             | [] ->
-                 assert false
-             | node :: rest ->
-                 stack := rest;
-                 node
-         in
-         let old_state = !state in
-         state := Node node;
-         match old_state with
-           | Undefined datas ->
-               node.nodes <- add name { nodes = Tag_map.empty; datas } node.nodes
-           | Data dm ->
-               node.datas <- add name (make_data dm) node.datas
-           | Node node' ->
-               node.nodes <- add name node' node.nodes);
+         (* Handle remaining data. *)
+         if dm.data_length > 0 then !handler#data (make_data dm);
+         (* Stop parsing this node. *)
+         !handler#stop;
+         (* Restore the previous handler. *)
+         match !stack with
+           | [] ->
+               assert false
+           | x :: l ->
+               handler := x;
+               stack := l);
     Expat.set_character_data_handler xp
       (fun str ->
-         match !state with
-           | Undefined datas ->
-               if not (is_space str) then state := Data { data_size = String.length str; data_data = [str] }
-           | Data dm ->
-               dm.data_size <- dm.data_size + String.length str;
-               dm.data_data <- str :: dm.data_data
-           | Node _ ->
-               if not (is_space str) then raise (Error "cannot mix elements and cdata"));
-    (xp, node)
+         (* Put data in the maker. *)
+         dm.data_length <- dm.data_length + String.length str;
+         dm.data_chunks <- str :: dm.data_chunks);
+    xp
 
   let buffer_size = 8192
 
-  let parse_stream stream =
-    let xp, node = create_parser () in
+  let parse_stream cell root_handler stream =
+    let xp = create_parser root_handler in
     let buffer = String.create 4096 in
     let rec loop () =
       match_lwt stream#read buffer 0 (String.length buffer) with
         | 0 ->
             Expat.final xp;
-            return node
+            root_handler#stop;
+            return (match !cell with
+                      | Some x -> x
+                      | None -> assert false)
         | n ->
             Expat.parse_sub xp buffer 0 n;
             loop ()
@@ -847,15 +752,23 @@ module XML = struct
     finally
       stream#close
 
-  let parse_string string =
-    let xp, node = create_parser () in
+  let parse_string cell root_handler string =
+    let xp = create_parser root_handler in
     try
       Expat.parse xp string;
       Expat.final xp;
-      node
+      root_handler#stop;
+      match !cell with
+        | Some x -> x
+        | None -> assert false
     with Expat.Expat_error error ->
       raise (Error ("invalid XML file: " ^ Expat.xml_error_to_string error))
 
+  (* +---------------------------------------------------------------+
+     | XML writer                                                    |
+     +---------------------------------------------------------------+ *)
+
+  (* Type of a XML writer. It writes to a gzipped file. *)
   type writer = {
     fd : Lwt_unix.file_descr;
     (* The file descriptor used for the output. *)
@@ -1030,52 +943,82 @@ module XML = struct
   let write_data oc tag data =
     lwt () = write_indent oc 0 in
     lwt () = write_string oc "<" in
-    lwt () = write_string oc tags.(tag) in
+    lwt () = write_string oc tag in
     lwt () = write_string oc ">" in
     lwt () = write_cdata oc data 0 0 in
     lwt () = write_string oc "</" in
-    lwt () = write_string oc tags.(tag) in
+    lwt () = write_string oc tag in
     lwt () = write_string oc ">\n" in
     return ()
 
-  let write_node oc tag f =
+  let write_node oc tag attrs f =
     lwt () = write_indent oc 0 in
     lwt () = write_string oc "<" in
-    lwt () = write_string oc tags.(tag) in
+    lwt () = write_string oc tag in
+    lwt () = Lwt_list.iter_s (fun (name, value) ->
+                                lwt () = write_string oc " " in
+                                lwt () = write_string oc name in
+                                lwt () = write_string oc "=\"" in
+                                lwt () = write_string oc value in
+                                lwt () = write_string oc "\"" in
+                                return ()) attrs in
     lwt () = write_string oc ">\n" in
     oc.indent <- oc.indent + 1;
     lwt () = f oc in
     oc.indent <- oc.indent - 1;
     lwt () = write_indent oc 0 in
     lwt () = write_string oc "</" in
-    lwt () = write_string oc tags.(tag) in
+    lwt () = write_string oc tag in
     lwt () = write_string oc ">\n" in
     return ()
 
-  let write_nodes oc tag writer l =
-    write_node oc tag (fun oc -> Lwt_list.iter_s (fun x -> writer oc x) l)
-end
+  let write_empty_node oc tag attrs =
+    lwt () = write_indent oc 0 in
+    lwt () = write_string oc "<" in
+    lwt () = write_string oc tag in
+    lwt () = Lwt_list.iter_s (fun (name, value) ->
+                                lwt () = write_string oc " " in
+                                lwt () = write_string oc name in
+                                lwt () = write_string oc "=\"" in
+                                lwt () = write_string oc value in
+                                lwt () = write_string oc "\"" in
+                                return ()) attrs in
+    lwt () = write_string oc "/>\n" in
+    return ()
 
-let safe_parse name f =
-  try
-    f ()
-  with exn ->
-    ignore (Lwt_log.error_f ~section ~exn "failed to parse %s XML" name);
-    raise (Error (Printf.sprintf "failed to parse %s XML" name))
+  let write_nodes oc tag writer l =
+    write_node oc tag [] (fun oc -> Lwt_list.iter_s (fun x -> writer oc x) l)
+end
 
 (* +-----------------------------------------------------------------+
    | Product informations                                            |
    +-----------------------------------------------------------------+ *)
 
-class product node = object
-  val expiry =
-    match get_data tag_expiry node with
-      | "None" -> None
-      | data -> Some (int_of_string data)
-  val product_type = get_data tag_type node
-  method product_type = product_type
-  method expiry = expiry
+class product product_type expiry = object
+  method product_type : string = product_type
+  method expiry : int option = expiry
 end
+
+class product_parser assign = object
+  inherit xml_parser
+
+  val mutable product_type = ""
+  val mutable expiry = None
+
+  method node tag attrs =
+    match tag with
+      | "product-type" -> new data (fun str -> product_type <- str)
+      | "expiry" -> new data (fun str -> expiry <- if str = "None" then None else Some (int_of_string str))
+      | _ -> new xml_parser
+
+  method stop =
+    assign (new product product_type expiry)
+end
+
+class products_parser assign =
+  node
+    "products"
+    (fun attrs -> new nodes "product" (fun attrs assign -> new product_parser assign) assign)
 
 (* +-----------------------------------------------------------------+
    | Commands                                                        |
@@ -1682,17 +1625,14 @@ let dispatch sp command payload =
 
     | CMD_PROD_INFO -> begin
         delay (save_raw_data "products info" payload);
-        let node = XML.parse_string payload in
-        match try Some (safe_parse "product info" (fun () -> List.map (fun node -> new product node) (get_nodes tag_product (get_node tag_products node)))) with _ -> None with
-          | None ->
-              return ()
-          | Some products ->
-              try
-                sp.set_products products;
-                return ()
-              with exn ->
-                ignore (Lwt_log.error ~section ~exn "failed to set products informations");
-                return ()
+        let cell = ref None in
+        let products = XML.parse_string cell (new products_parser (fun x -> cell := Some x)) payload in
+        try
+          sp.set_products products;
+          return ()
+        with exn ->
+          ignore (Lwt_log.error ~section ~exn "failed to set products informations");
+          return ()
       end
 
     | CMD_COUNTRY_CODE -> begin
@@ -2457,6 +2397,14 @@ module Weak_cache : sig
   val create : int -> 'a t
     (* Create a new empty cache. *)
 
+  val get : 'a t -> id -> 'a option
+    (* [get cache id] returns the element associated to [id] in
+       [cache] if any. *)
+
+  val add : 'a t -> id -> 'a -> unit
+    (* [add cache id x] binds [id] to [x] in [cache] if [id] is not
+       already bound. *)
+
   val find : 'a t -> id -> (unit -> 'a) -> 'a
     (* [find cache id make] search for an element with id [id] in
        [cache]. If one is found it is returned, otherwise a new one is
@@ -2484,6 +2432,23 @@ end = struct
 
   let finalise cache id obj =
     Table.remove cache id
+
+  let get cache id =
+    try
+      Weak.get (Table.find cache id) 0
+    with Not_found ->
+      None
+
+  let add cache id x =
+    try
+      let weak = Table.find cache id in
+      if Weak.get weak 0 = None then
+        Weak.set weak 0 (Some x)
+    with Not_found ->
+      let weak = Weak.create 1 in
+      Weak.set weak 0 (Some x);
+      Table.add cache id weak;
+      Gc.finalise (finalise cache id) x
 
   let find cache id make =
     try
@@ -2548,481 +2513,265 @@ end = struct
 end
 
 (* +-----------------------------------------------------------------+
-   | Documents                                                       |
+   | Structures                                                      |
    +-----------------------------------------------------------------+ *)
 
-class portrait node (id : id) = object
-  val width = int_of_string (get_data tag_width node)
-  val height = int_of_string (get_data tag_height node)
-  method id = id
-  method link = Image id
-  method width = width
-  method height = height
+class portrait id link width height = object
+  method id : id = id
+  method link : link = link
+  method width : int = width
+  method height : int = height
 end
 
-let write_portrait oc portrait =
-  XML.write_node oc tag_portrait
+class biography text portraits = object
+  method text : string = text
+  method portraits : portrait list = portraits
+end
+
+class restriction catalogues forbidden allowed = object
+  method catalogues : string list option = catalogues
+  method forbidden : string list option = forbidden
+  method allowed : string list option = allowed
+end
+
+class similar_artist id link name portrait genres years_active restrictions = object
+  method id : id = id
+  method link : link = link
+  method name : string = name
+  method portrait : id option = portrait
+  method genres : string list = genres
+  method years_active : int list = years_active
+  method restrictions : restriction list = restrictions
+end
+
+class file id format bitrate = object
+  method id : id = id
+  method format : string = format
+  method bitrate : int = bitrate
+end
+
+class alternative id link files restrictions = object
+  method id : id = id
+  method link : link = link
+  method files : file list = files
+  method restrictions : restriction list = restrictions
+end
+
+class track id link title explicit artists artists_id album album_id album_artist album_artist_id year number length files cover popularity external_ids alternatives  = object
+  method id : id = id
+  method link : link = link
+  method title : string = title
+  method explicit : bool = explicit
+  method artists : string list = artists
+  method artists_id : id list = artists_id
+  method album : string = album
+  method album_id : id = album_id
+  method album_artist : string = album_artist
+  method album_artist_id : id = album_artist_id
+  method year : int = year
+  method number : int = number
+  method length : float = length
+  method files : file list = files
+  method cover : id option = cover
+  method popularity : float = popularity
+  method external_ids : (string * string) list = external_ids
+  method alternatives : alternative list = alternatives
+end
+
+class disc number name tracks = object
+  method number : int = number
+  method name : string option = name
+  method tracks : id list = tracks
+end
+
+class album id link name artist artist_id album_type year cover copyrights restrictions external_ids discs = object
+  method id : id = id
+  method link : link = link
+  method name : string = name
+  method artist : string = artist
+  method artist_id : id = artist_id
+  method album_type : string = album_type
+  method year : int = year
+  method cover : id option = cover
+  method copyrights : (string * string) list = copyrights
+  method restrictions : restriction list = restrictions
+  method external_ids : (string * string) list = external_ids
+  method discs : disc list = discs
+end
+
+class artist id link name portrait biographies similar_artists genres years_active albums = object
+  method id : id = id
+  method link : link = link
+  method name : string = name
+  method portrait : portrait option = portrait
+  method biographies : biography list = biographies
+  method similar_artists : similar_artist list = similar_artists
+  method genres : string list = genres
+  method years_active : int list = years_active
+  method albums : id list = albums
+end
+
+class artist_search id link name portrait popularity restrictions = object
+  method id : id = id
+  method link : link = link
+  method name : string = name
+  method portrait : portrait option = portrait
+  method popularity : float = popularity
+  method restrictions : restriction list = restrictions
+end
+
+class album_search id link name artist artist_id cover popularity restrictions external_ids = object
+  method id : id = id
+  method link : link = link
+  method name : string = name
+  method artist : string = artist
+  method artist_id : id = artist_id
+  method cover : id option = cover
+  method popularity : float = popularity
+  method restrictions : restriction list = restrictions
+  method external_ids : (string * string) list = external_ids
+end
+
+class simple_search_result link did_you_mean total_artists total_albums total_tracks = object
+  method link : link = link
+  method did_you_mean : string option = did_you_mean
+  method total_artists : int = total_artists
+  method total_albums : int = total_albums
+  method total_tracks : int = total_tracks
+end
+
+class search_result link did_you_mean total_artists total_albums total_tracks artists albums tracks = object
+  method link : link = link
+  method did_you_mean : string option = did_you_mean
+  method total_artists : int = total_artists
+  method total_albums : int = total_albums
+  method total_tracks : int = total_tracks
+  method artists : artist_search list = artists
+  method albums : album_search list = albums
+  method tracks : track list = tracks
+end
+
+(* +-----------------------------------------------------------------+
+   | Writers                                                         |
+   +-----------------------------------------------------------------+ *)
+
+let write_portrait oc (portrait : portrait) =
+  XML.write_node oc "portrait" []
     (fun oc ->
-       lwt () = XML.write_data oc tag_id (string_of_id portrait#id) in
-       lwt () = XML.write_data oc tag_width (string_of_int portrait#width) in
-       lwt () = XML.write_data oc tag_height (string_of_int portrait#height) in
+       lwt () = XML.write_data oc "id" (string_of_id portrait#id) in
+       lwt () = XML.write_data oc "width" (string_of_int portrait#width) in
+       lwt () = XML.write_data oc "height" (string_of_int portrait#height) in
        return ())
 
-let portraits = Weak_cache.create 1024
-
-let make_portrait node =
-  let id = id_of_string (get_data tag_id node) in
-  Weak_cache.find portraits id (fun () -> new portrait node id)
-
-let make_portrait_option node =
-  if Tag_map.is_empty node.datas then
-    None
-  else begin
-    let id = id_of_string (get_data tag_id node) in
-    Some (Weak_cache.find portraits id (fun () -> new portrait node id))
-  end
-
-class biography node = object
-  val text = get_data tag_text node
-  val portraits = List.map make_portrait (get_nodes tag_portrait (get_node tag_portraits node))
-  method text = text
-  method portraits = portraits
-end
-
-let write_biography oc bio =
-  XML.write_node oc tag_bio
+let write_biography oc (bio : biography) =
+  XML.write_node oc "bio" []
     (fun oc ->
-       lwt () = XML.write_data oc tag_text bio#text in
-       lwt () = XML.write_nodes oc tag_portraits write_portrait bio#portraits in
+       lwt () = XML.write_data oc "text" bio#text in
+       lwt () = XML.write_nodes oc "portraits" write_portrait bio#portraits in
        return ())
 
-class restriction node = object
-  val catalogues = split ',' (get_data tag_catalogues node)
-  val forbidden = try split_space_coma (get_data tag_forbidden node) with Not_found -> []
-  val allowed = try split_space_coma (get_data tag_allowed node) with Not_found -> []
-  method catalogues = catalogues
-  method forbidden = forbidden
-  method allowed = allowed
-end
+let write_restriction oc (restriction : restriction) =
+  let attrs = [] in
+  let attrs = match restriction#allowed with Some l -> ("allowed", String.concat "," l) :: attrs | None -> attrs in
+  let attrs = match restriction#forbidden with Some l -> ("forbidden", String.concat "," l) :: attrs | None -> attrs in
+  let attrs = match restriction#catalogues with Some l -> ("catalogues", String.concat "," l) :: attrs | None -> attrs in
+  XML.write_empty_node oc "restriction" attrs
 
-let write_restriction oc restriction =
-  XML.write_node oc tag_restriction
+let write_similar_artist oc (similar_artist : similar_artist) =
+  XML.write_node oc "similar-artist" []
     (fun oc ->
-       lwt () = XML.write_data oc tag_catalogues (String.concat "," restriction#catalogues) in
-       lwt () = XML.write_data oc tag_forbidden (String.concat "," restriction#forbidden) in
-       lwt () = XML.write_data oc tag_allowed (String.concat "," restriction#allowed) in
+       lwt () = XML.write_data oc "id" (string_of_id similar_artist#id) in
+       lwt () = XML.write_data oc "name" similar_artist#name in
+       lwt () = match similar_artist#portrait with Some x -> XML.write_data oc "portrait" (string_of_id x) | None -> return () in
+       lwt () = XML.write_data oc "genres" (String.concat "," similar_artist#genres) in
+       lwt () = XML.write_data oc "years-active" (String.concat "," (List.map string_of_int similar_artist#years_active)) in
+       lwt () = XML.write_nodes oc "restrictions" write_restriction similar_artist#restrictions in
        return ())
-
-class similar_artist node (id : id) = object
-  val name = get_data tag_name node
-  val portrait = id_of_string (get_data tag_portrait node)
-  val genres = split ',' (get_data tag_genres node)
-  val years_active = List.map int_of_string (split ',' (get_data tag_years_active node));
-  val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
-  method id = id
-  method link = Artist id
-  method name = name
-  method portrait = portrait
-  method genres = genres
-  method years_active = years_active
-  method restrictions = restrictions
-end
-
-let write_similar_artist oc similar_artist =
-  XML.write_node oc tag_similar_artist
-    (fun oc ->
-       lwt () = XML.write_data oc tag_id (string_of_id similar_artist#id) in
-       lwt () = XML.write_data oc tag_name similar_artist#name in
-       lwt () = XML.write_data oc tag_portrait (string_of_id similar_artist#portrait) in
-       lwt () = XML.write_data oc tag_genres (String.concat "," similar_artist#genres) in
-       lwt () = XML.write_data oc tag_years_active (String.concat "," (List.map string_of_int similar_artist#years_active)) in
-       lwt () = XML.write_nodes oc tag_restrictions write_restriction similar_artist#restrictions in
-       return ())
-
-let similar_artists = Weak_cache.create 1024
-
-let make_similar_artist node =
-  let id = id_of_string (get_data tag_id node) in
-  Weak_cache.find similar_artists id (fun () -> new similar_artist node id)
-
-class file node (id : id) = object
-  val format =
-    match split ',' (get_data tag_format node) with
-      | format :: bitrate :: _ ->
-          (format, int_of_string bitrate)
-      | _ ->
-          raise (Error "invalid file format")
-  method id = id
-  method format = fst format
-  method bitrate = snd format
-end
 
 let write_file oc file =
-  XML.write_node oc tag_file
+  XML.write_empty_node oc "file" [("id", string_of_id file#id); ("format", Printf.sprintf "%s,%d" file#format file#bitrate)]
+
+let write_alternative oc (alternative : alternative) =
+  XML.write_node oc "track" []
     (fun oc ->
-       lwt () = XML.write_data oc tag_id (string_of_id file#id) in
-       lwt () = XML.write_data oc tag_format (Printf.sprintf "%s,%d" file#format file#bitrate) in
+       lwt () = XML.write_data oc "id" (string_of_id alternative#id) in
+       lwt () = XML.write_nodes oc "files" write_file alternative#files in
+       lwt () = XML.write_nodes oc "restrictions" write_restriction alternative#restrictions in
        return ())
-
-let files = Weak_cache.create 1024
-
-let make_file node =
-  let id = id_of_string (get_data tag_id node) in
-  Weak_cache.find files id (fun () -> new file node id)
-
-class alternative node (id : id) = object
-  val files = List.map make_file (get_nodes tag_file (get_node tag_files node))
-  val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
-  method id = id
-  method link = Track id
-  method files = files
-  method restrictions = restrictions
-end
-
-let write_alternative oc alternative =
-  XML.write_node oc tag_track
-    (fun oc ->
-       lwt () = XML.write_data oc tag_id (string_of_id alternative#id) in
-       lwt () = XML.write_nodes oc tag_files write_file alternative#files in
-       lwt () = XML.write_nodes oc tag_restrictions write_restriction alternative#restrictions in
-       return ())
-
-let alternatives = Weak_cache.create 1024
-
-let make_alternative node =
-  let id = id_of_string (get_data tag_id node) in
-  Weak_cache.find alternatives id (fun () -> new alternative node id)
-
-let make_external_id node =
-  (get_data tag_type node, get_data tag_id node)
 
 let write_external_id oc (t, i) =
-  XML.write_node oc tag_external_id
+  XML.write_empty_node oc "external-id" [("type", t); ("id", i)]
+
+let write_track oc (track : track) =
+  XML.write_node oc "track" []
     (fun oc ->
-       lwt () = XML.write_data oc tag_type t in
-       lwt () = XML.write_data oc tag_id i in
+       lwt () = XML.write_data oc "mlspot-cache-version" (string_of_int track_cache_version) in
+       lwt () = XML.write_data oc "id" (string_of_id track#id) in
+       lwt () = XML.write_data oc "title" track#title in
+       lwt () = XML.write_data oc "explicit" (string_of_bool track#explicit) in
+       lwt () = Lwt_list.iter_s (XML.write_data oc "artist") track#artists in
+       lwt () = Lwt_list.iter_s (XML.write_data oc "artist-id") (List.map string_of_id track#artists_id) in
+       lwt () = XML.write_data oc "album" track#album in
+       lwt () = XML.write_data oc "album-id" (string_of_id track#album_id) in
+       lwt () = XML.write_data oc "album-artist" track#album_artist in
+       lwt () = XML.write_data oc "album-artist-id" (string_of_id track#album_artist_id) in
+       lwt () = XML.write_data oc "track-number" (string_of_int track#number) in
+       lwt () = XML.write_data oc "length" (string_of_int (int_of_float (track#length *. 1000.))) in
+       lwt () = XML.write_nodes oc "files" write_file track#files in
+       lwt () = match track#cover with Some id -> XML.write_data oc "cover" (string_of_id id) | None -> return () in
+       lwt () = XML.write_data oc "year" (string_of_int track#year) in
+       lwt () = XML.write_data oc "popularity" (string_of_float track#popularity) in
+       lwt () = XML.write_nodes oc "external-ids" write_external_id track#external_ids in
+       lwt () = XML.write_nodes oc "alternatives" write_alternative track#alternatives in
        return ())
 
-class track_common node (id : id) = object
-  val title = get_data tag_title node
-  val explicit = try bool_of_string (get_data tag_explicit node) with Not_found -> false
-  val artists = get_datas tag_artist node
-  val artists_id = List.map id_of_string (get_datas tag_artist_id node)
-  val number = int_of_string (get_data tag_track_number node)
-  val length = try float (int_of_string (get_data tag_length node)) /. 1000. with Not_found -> 0.
-  val files = List.map make_file (get_nodes tag_file (get_node tag_files node))
-  val popularity = float_of_string (get_data tag_popularity node)
-  val external_ids = List.map (fun node -> make_external_id node) (get_nodes tag_external_id (get_node tag_external_ids node))
-  val alternatives = try List.map make_alternative (get_nodes tag_track (get_node tag_alternatives node)) with Not_found -> []
-  method id = id
-  method link = Track id
-  method title = title
-  method explicit = explicit
-  method artists = artists
-  method artists_id = artists_id
-  method number = number
-  method length = length
-  method files = files
-  method popularity = popularity
-  method external_ids = external_ids
-  method alternatives = alternatives
-end
-
-class track node (id : id) = object
-  inherit track_common node id
-  val album = get_data tag_album node
-  val album_id = id_of_string (get_data tag_album_id node)
-  val album_artist = get_data tag_album_artist node
-  val album_artist_id = id_of_string (get_data tag_album_artist_id node)
-  val cover = try Some (id_of_string (get_data tag_cover node)) with Not_found -> None
-  val year = try int_of_string (get_data tag_year node) with Not_found -> 0
-  method album = album
-  method album_id = album_id
-  method album_artist = album_artist
-  method album_artist_id = album_artist_id
-  method cover = cover
-  method year = year
-end
-
-type album_temp = {
-  at_name : string;
-  at_id : id;
-  at_artist : string;
-  at_artist_id : id;
-  at_cover : id option;
-  at_year : int;
-}
-
-class track_from_album node id album = object
-  inherit track_common node id
-  method album = album.at_name
-  method album_id = album.at_id
-  method album_artist = album.at_artist
-  method album_artist_id = album.at_artist_id
-  method cover = album.at_cover
-  method year = album.at_year
-end
-
-let write_track oc track =
-  XML.write_node oc tag_track
-    (fun oc ->
-       lwt () = XML.write_data oc tag_mlspot_cache_version (string_of_int track_cache_version) in
-       lwt () = XML.write_data oc tag_id (string_of_id track#id) in
-       lwt () = XML.write_data oc tag_title track#title in
-       lwt () = XML.write_data oc tag_explicit (string_of_bool track#explicit) in
-       lwt () = Lwt_list.iter_s (XML.write_data oc tag_artist) track#artists in
-       lwt () = Lwt_list.iter_s (XML.write_data oc tag_artist_id) (List.map string_of_id track#artists_id) in
-       lwt () = XML.write_data oc tag_album track#album in
-       lwt () = XML.write_data oc tag_album_id (string_of_id track#album_id) in
-       lwt () = XML.write_data oc tag_album_artist track#album_artist in
-       lwt () = XML.write_data oc tag_album_artist_id (string_of_id track#album_artist_id) in
-       lwt () = XML.write_data oc tag_track_number (string_of_int track#number) in
-       lwt () = XML.write_data oc tag_length (string_of_int (int_of_float (track#length *. 1000.))) in
-       lwt () = XML.write_nodes oc tag_files write_file track#files in
-       lwt () = match track#cover with Some id -> XML.write_data oc tag_cover (string_of_id id) | None -> return () in
-       lwt () = XML.write_data oc tag_year (string_of_int track#year) in
-       lwt () = XML.write_data oc tag_popularity (string_of_float track#popularity) in
-       lwt () = XML.write_nodes oc tag_external_ids write_external_id track#external_ids in
-       lwt () = XML.write_nodes oc tag_alternatives write_alternative track#alternatives in
-       return ())
-
-let tracks = Weak_cache.create 1024
-
-let make_track node =
-  let id = id_of_string (get_data tag_id node) in
-  Weak_cache.find tracks id (fun () -> new track node id)
-
-let make_track_from_album album node =
-  let id = id_of_string (get_data tag_id node) in
-  Weak_cache.find tracks id (fun () -> new track_from_album node id album)
-
-class disc_common node = object
-  val number = int_of_string (get_data tag_disc_number node)
-  val name = try Some (get_data tag_name node) with Not_found -> None
-  method number = number
-  method name = name
-end
-
-class disc node album = object
-  inherit disc_common node
-  val tracks = List.map (make_track_from_album album) (get_nodes tag_track node)
-  method tracks = tracks
-end
-
-let disc_from_cache node get_tracks =
-  lwt tracks = get_tracks (List.map id_of_string (get_datas tag_track node)) in
-  return (object
-            inherit disc_common node
-            method tracks = tracks
-          end)
-
-let write_track_id oc track =
-  XML.write_data oc tag_track (string_of_id track#id)
+let write_track_id oc id =
+  XML.write_data oc "track" (string_of_id id)
 
 let write_disc oc disc =
-  XML.write_node oc tag_disc
+  XML.write_node oc "disc" []
     (fun oc ->
-       lwt () = XML.write_data oc tag_disc_number (string_of_int disc#number) in
-       lwt () = XML.write_data oc tag_name (match disc#name with Some name -> name | None -> "") in
-       lwt () = XML.write_nodes oc tag_tracks write_track_id disc#tracks in
+       lwt () = XML.write_data oc "disc-number" (string_of_int disc#number) in
+       lwt () = match disc#name with Some name -> XML.write_data oc "name" name | None -> return () in
+       lwt () = Lwt_list.iter_s (write_track_id oc) disc#tracks in
        return ())
-
-let album_temp node id = {
-  at_name = get_data tag_name node;
-  at_id = id;
-  at_artist = get_data tag_artist node;
-  at_artist_id = id_of_string (get_data tag_artist_id node);
-  at_cover = (try Some (id_of_string (get_data tag_cover node)) with Not_found -> None);
-  at_year = (try int_of_string (get_data tag_year node) with Not_found -> 0);
-}
-
-class album_common node at (id : id) = object
-  val name = at.at_name
-  val artist = at.at_artist
-  val artist_id = at.at_artist_id
-  val album_type = get_data tag_album_type node
-  val year = at.at_year
-  val cover = at.at_cover
-  val copyrights =
-    let node = get_node tag_copyright node in
-    List.map (fun c -> ("c", c)) (get_datas tag_c node) @ List.map (fun c -> ("p", c)) (get_datas tag_p node)
-  val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
-  val external_ids = try List.map (fun node -> make_external_id node) (get_nodes tag_external_id (get_node tag_external_ids node)) with Not_found -> []
-  method id = id
-  method link = Album id
-  method name = name
-  method artist = artist
-  method artist_id = artist_id
-  method album_type = album_type
-  method year = year
-  method cover = cover
-  method copyrights = copyrights
-  method restrictions = restrictions
-  method external_ids = external_ids
-end
-
-class album node (id : id) =
-  let at = album_temp node id in
-object
-  inherit album_common node at id
-  val discs = List.map (fun node -> new disc node at) (get_nodes tag_disc (get_node tag_discs node))
-  method discs = discs
-end
-
-let album_from_cache node get_tracks =
-  lwt discs = Lwt_list.map_p (fun node -> disc_from_cache node get_tracks) (get_nodes tag_disc (get_node tag_discs node)) in
-  let id = id_of_string (get_data tag_id node) in
-  return (object
-            inherit album_common node (album_temp node id) id
-            method discs = discs
-          end)
 
 let write_copyright oc (kind, data) =
-  XML.write_data oc
-    (match kind with
-       | "c" -> tag_c
-       | "p" -> tag_p
-       | _ -> assert false)
-    data
+  XML.write_data oc kind data
 
-let write_album oc album =
-  XML.write_node oc tag_album
+let write_album oc (album : album) =
+  XML.write_node oc "album" []
     (fun oc ->
-       lwt () = XML.write_data oc tag_mlspot_cache_version (string_of_int album_cache_version) in
-       lwt () = XML.write_data oc tag_id (string_of_id album#id) in
-       lwt () = XML.write_data oc tag_name album#name in
-       lwt () = XML.write_data oc tag_artist album#artist in
-       lwt () = XML.write_data oc tag_artist_id (string_of_id album#artist_id) in
-       lwt () = XML.write_data oc tag_album_type album#album_type in
-       lwt () = XML.write_data oc tag_year (string_of_int album#year) in
-       lwt () = match album#cover with Some id -> XML.write_data oc tag_cover (string_of_id id) | None -> return () in
-       lwt () = XML.write_nodes oc tag_copyright write_copyright album#copyrights in
-       lwt () = XML.write_nodes oc tag_restrictions write_restriction album#restrictions in
-       lwt () = XML.write_nodes oc tag_external_ids write_external_id album#external_ids in
-       lwt () = XML.write_nodes oc tag_discs write_disc album#discs in
+       lwt () = XML.write_data oc "mlspot-cache-version" (string_of_int album_cache_version) in
+       lwt () = XML.write_data oc "id" (string_of_id album#id) in
+       lwt () = XML.write_data oc "name" album#name in
+       lwt () = XML.write_data oc "artist" album#artist in
+       lwt () = XML.write_data oc "artist-id" (string_of_id album#artist_id) in
+       lwt () = XML.write_data oc "album-type" album#album_type in
+       lwt () = XML.write_data oc "year" (string_of_int album#year) in
+       lwt () = match album#cover with Some id -> XML.write_data oc "cover" (string_of_id id) | None -> return () in
+       lwt () = XML.write_nodes oc "copyright" write_copyright album#copyrights in
+       lwt () = XML.write_nodes oc "restrictions" write_restriction album#restrictions in
+       lwt () = XML.write_nodes oc "external-ids" write_external_id album#external_ids in
+       lwt () = XML.write_nodes oc "discs" write_disc album#discs in
        return ())
 
-let albums = Weak_cache.create 1024
+let write_album_id oc id =
+  XML.write_data oc "album" (string_of_id id)
 
-let make_album node =
-  let id = id_of_string (get_data tag_id node) in
-  Weak_cache.find albums id (fun () -> new album node id)
-
-class artist_common node (id : id) = object
-  val name = get_data tag_name node
-  val portrait = make_portrait (get_node tag_portrait node)
-  val biographies = List.map (fun node -> new biography node) (get_nodes tag_bio (get_node tag_bios node))
-  val similar_artists = List.map make_similar_artist (get_nodes tag_similar_artist (get_node tag_similar_artists node))
-  val genres = split ',' (get_data tag_genres node)
-  val years_active = List.map int_of_string (split ',' (get_data tag_years_active node))
-  method id = id
-  method link = Artist id
-  method name = name
-  method portrait = portrait
-  method biographies = biographies
-  method similar_artists = similar_artists
-  method genres = genres
-  method years_active = years_active
-end
-
-class artist node (id : id) = object
-  inherit artist_common node id
-  val albums = List.map make_album (get_nodes tag_album (get_node tag_albums node))
-  method albums = albums
-end
-
-let artist_from_cache node get_album =
-  lwt albums = Lwt_list.map_p (fun str -> get_album (id_of_string str)) (get_datas tag_album (get_node tag_albums node)) in
-  let id = id_of_string (get_data tag_id node) in
-  return (object
-            inherit artist_common node id
-            method albums = albums
-          end)
-
-let write_album_id oc album =
-  XML.write_data oc tag_album (string_of_id album#id)
-
-let write_artist oc artist =
-  XML.write_node oc tag_artist
+let write_artist oc (artist : artist) =
+  XML.write_node oc "artist" []
     (fun oc ->
-       lwt () = XML.write_data oc tag_mlspot_cache_version (string_of_int artist_cache_version) in
-       lwt () = XML.write_data oc tag_id (string_of_id artist#id) in
-       lwt () = XML.write_data oc tag_name artist#name in
-       lwt () = write_portrait oc artist#portrait in
-       lwt () = XML.write_nodes oc tag_bios write_biography artist#biographies in
-       lwt () = XML.write_nodes oc tag_similar_artists write_similar_artist artist#similar_artists in
-       lwt () = XML.write_data oc tag_genres (String.concat "," artist#genres) in
-       lwt () = XML.write_data oc tag_years_active (String.concat "," (List.map string_of_int artist#years_active)) in
-       lwt () = XML.write_nodes oc tag_albums write_album_id artist#albums in
+       lwt () = XML.write_data oc "mlspot-cache-version" (string_of_int artist_cache_version) in
+       lwt () = XML.write_data oc "id" (string_of_id artist#id) in
+       lwt () = XML.write_data oc "name" artist#name in
+       lwt () = match artist#portrait with Some portrait -> write_portrait oc portrait | None -> return () in
+       lwt () = XML.write_nodes oc "bios" write_biography artist#biographies in
+       lwt () = XML.write_nodes oc "similar-artists" write_similar_artist artist#similar_artists in
+       lwt () = XML.write_data oc "genres" (String.concat "," artist#genres) in
+       lwt () = XML.write_data oc "years-active" (String.concat "," (List.map string_of_int artist#years_active)) in
+       lwt () = XML.write_nodes oc "albums" write_album_id artist#albums in
        return ())
-
-let artists = Weak_cache.create 1024
-
-let make_artist node =
-  let id = id_of_string (get_data tag_id node) in
-  Weak_cache.find artists id (fun () -> new artist node id)
-
-class artist_search node (id : id) = object
-  val name = get_data tag_name node
-  val portrait = make_portrait_option (get_node tag_portrait node)
-  val popularity = float_of_string (get_data tag_popularity node)
-  val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
-  method id = id
-  method link = Artist id
-  method name = name
-  method portrait = portrait
-  method popularity = popularity
-  method restrictions = restrictions
-end
-
-let artist_searchs = Weak_cache.create 1024
-
-let make_artist_search node =
-  let id = id_of_string (get_data tag_id node) in
-  Weak_cache.find artist_searchs id (fun () -> new artist_search node id)
-
-class album_search node (id : id) = object
-  val name = get_data tag_name node
-  val artist = get_data tag_artist_name node
-  val artist_id = id_of_string (get_data tag_artist_id node)
-  val cover = try Some (id_of_string (get_data tag_cover node)) with Not_found -> None
-  val popularity = float_of_string (get_data tag_popularity node)
-  val restrictions = try List.map (fun node -> new restriction node) (get_nodes tag_restriction (get_node tag_restrictions node)) with Not_found -> []
-  val external_ids = try List.map (fun node -> make_external_id node) (get_nodes tag_external_id (get_node tag_external_ids node)) with Not_found -> []
-  method id = id
-  method link = Album id
-  method name = name
-  method artist = artist
-  method artist_id = artist_id
-  method cover = cover
-  method popularity = popularity
-  method restrictions = restrictions
-  method external_ids = external_ids
-end
-
-let album_searchs = Weak_cache.create 1024
-
-let make_album_search node =
-  let id = id_of_string (get_data tag_id node) in
-  Weak_cache.find album_searchs id (fun () -> new album_search node id)
-
-class search_result query node = object
-  val did_you_mean = try Some (get_data tag_did_you_mean node) with Not_found -> None
-  val total_artists = int_of_string (get_data tag_total_artists node)
-  val total_albums = int_of_string (get_data tag_total_albums node)
-  val total_tracks = int_of_string (get_data tag_total_tracks node)
-  val artists = List.map make_artist_search (get_nodes tag_artist (get_node tag_artists node))
-  val albums = List.map make_album_search (get_nodes tag_album (get_node tag_albums node))
-  val tracks = List.map make_track (get_nodes tag_track (get_node tag_tracks node))
-  method link = Search query
-  method did_you_mean = did_you_mean
-  method total_artists = total_artists
-  method total_albums = total_albums
-  method total_tracks = total_tracks
-  method artists = artists
-  method albums = albums
-  method tracks = tracks
-end
 
 (* +-----------------------------------------------------------------+
    | Saving to the cache                                             |
@@ -3050,18 +2799,15 @@ let save_album session album =
         return ()
     | Some (file, fd) ->
         let oc = XML.create_writer fd file in
-        lwt () =
-          try_lwt
-            lwt () = write_album oc album in
-            XML.close oc
-          with exn ->
-            ignore (Lwt_log.error_f ~section ~exn "failed to save metadata for album %S" (string_of_id album#id));
-            XML.abort oc
-          finally
-            Cache.release ();
-            return ()
-        in
-        Lwt_list.iter_p (fun disc -> Lwt_list.iter_p (save_track session) disc#tracks) album#discs
+        try_lwt
+          lwt () = write_album oc album in
+          XML.close oc
+        with exn ->
+          ignore (Lwt_log.error_f ~section ~exn "failed to save metadata for album %S" (string_of_id album#id));
+          XML.abort oc
+        finally
+          Cache.release ();
+          return ()
 
 let save_artist session artist =
   match_lwt Cache.get_writer session (make_filename ["metadata"; "artists"; (string_of_id artist#id ^ ".xml.gz")]) with
@@ -3069,28 +2815,636 @@ let save_artist session artist =
         return ()
     | Some (file, fd) ->
         let oc = XML.create_writer fd file in
-        lwt () =
-          try_lwt
-            lwt () = write_artist oc artist in
-            XML.close oc
-          with exn ->
-            ignore (Lwt_log.error_f ~section ~exn "failed to save metadata for artist %S" (string_of_id artist#id));
-            XML.abort oc
-          finally
-            Cache.release ();
-            return ()
-        in
-        Lwt_list.iter_p (save_album session) artist#albums
+        try_lwt
+          lwt () = write_artist oc artist in
+          XML.close oc
+        with exn ->
+          ignore (Lwt_log.error_f ~section ~exn "failed to save metadata for artist %S" (string_of_id artist#id));
+          XML.abort oc
+        finally
+          Cache.release ();
+          return ()
+
+(* +-----------------------------------------------------------------+
+   | Parsers                                                         |
+   +-----------------------------------------------------------------+ *)
+
+let dummy_id = ID.of_bytes ""
+
+let portraits = Weak_cache.create 1024
+
+class portrait_parser assign = object
+  inherit xml_parser
+
+  val mutable id = dummy_id
+  val mutable width = 0
+  val mutable height = 0
+  val mutable cached = None
+
+  method node tag attrs =
+    if cached = None then
+      match tag with
+        | "id" -> new data (fun x -> id <- id_of_string x; cached <- Weak_cache.get portraits id)
+        | "width" -> new data (fun x -> width <- int_of_string x)
+        | "height" -> new data (fun x -> height <- int_of_string x)
+        | _ -> new xml_parser
+    else
+      new xml_parser
+
+  method stop =
+    match cached with
+      | Some x ->
+          assign x
+      | None ->
+          assign (Weak_cache.find portraits id (fun () -> new portrait id (Image id) width height))
+end
+
+class biography_parser assign = object
+  inherit xml_parser
+
+  val mutable text = ""
+  val mutable portraits = []
+
+  method node tag attrs =
+    match tag with
+      | "text" -> new data (fun x -> text <- x)
+      | "portraits" -> new nodes "portrait" (fun attrs assign -> new portrait_parser assign) (fun x -> portraits <- x)
+      | _ -> new xml_parser
+
+  method stop =
+    assign (new biography text portraits)
+end
+
+let parse_restriction attrs assign =
+  let catalogues = ref None in
+  let forbidden = ref None in
+  let allowed = ref None in
+  List.iter
+    (function
+       | ("catalogues", x) -> catalogues := Some (split ',' x)
+       | ("forbidden", x) -> forbidden := Some (split_space_coma x)
+       | ("allowed", x) -> allowed := Some (split_space_coma x)
+       | _ -> ())
+    attrs;
+  assign (new restriction !catalogues !forbidden !allowed);
+  new xml_parser
+
+let similar_artists = Weak_cache.create 1024
+
+class similar_artist_parser assign = object
+  inherit xml_parser
+
+  val mutable id = dummy_id
+  val mutable name = ""
+  val mutable portrait = None
+  val mutable genres = []
+  val mutable years_active = []
+  val mutable restrictions = []
+  val mutable cached = None
+
+  method node tag attrs =
+    if cached = None then
+      match tag with
+        | "id" -> new data (fun x -> id <- id_of_string x; cached <- Weak_cache.get similar_artists id)
+        | "name" -> new data (fun x -> name <- x)
+        | "portrait" -> new data (fun x -> portrait <- Some (id_of_string x))
+        | "genres" -> new data (fun x -> genres <- split ',' x)
+        | "years-active" -> new data (fun x -> years_active <- List.map int_of_string (split ',' x))
+        | "restrictions" -> new nodes "restriction" parse_restriction (fun x -> restrictions <- x)
+        | _ -> new xml_parser
+    else
+      new xml_parser
+
+  method stop =
+    match cached with
+      | Some x ->
+          assign x
+      | None ->
+          assign (Weak_cache.find similar_artists id (fun () -> new similar_artist id (Artist id) name portrait genres years_active restrictions))
+end
+
+let files = Weak_cache.create 1024
+
+let parse_file attrs assign =
+  let id = ref dummy_id in
+  let format = ref "" in
+  let bitrate = ref 0 in
+  List.iter
+    (function
+       | ("id", x) -> id := id_of_string x
+       | ("format", x) -> begin
+           match split ',' x with
+             | x :: y :: _ ->
+                 format := x;
+                 bitrate := int_of_string y
+             | _ ->
+                 failwith "invalid file format"
+         end
+       | _ -> ())
+    attrs;
+  assign (Weak_cache.find files !id (fun () -> new file !id !format !bitrate));
+  new xml_parser
+
+let alternatives = Weak_cache.create 1024
+
+class alternative_parser assign = object
+  inherit xml_parser
+
+  val mutable id = dummy_id
+  val mutable files = []
+  val mutable restrictions = []
+  val mutable cached = None
+
+  method node tag attrs =
+    if cached = None then
+      match tag with
+        | "id" -> new data (fun x -> id <- id_of_string x; cached <- Weak_cache.get alternatives id)
+        | "files" -> new nodes "file" parse_file (fun x -> files <- x)
+        | "restrictions" -> new nodes "restriction" parse_restriction (fun x -> restrictions <- x)
+        | _ -> new xml_parser
+    else
+      new xml_parser
+
+  method stop =
+    match cached with
+      | Some x ->
+          assign x
+      | None ->
+          assign (Weak_cache.find alternatives id (fun () -> new alternative id (Track id) files restrictions))
+end
+
+let parse_external_id attrs assign =
+  let typ = ref "" in
+  let id = ref "" in
+  List.iter
+    (function
+       | ("type", x) -> typ := x
+       | ("id", x) -> id := x
+       | _ -> ())
+    attrs;
+  assign (!typ, !id);
+  new xml_parser
+
+let tracks = Weak_cache.create 1024
+
+class track_parser session assign = object
+  inherit xml_parser
+
+  val mutable id = dummy_id
+  val mutable title = ""
+  val mutable explicit = false
+  val mutable artists = []
+  val mutable artists_id = []
+  val mutable album = ""
+  val mutable album_id = dummy_id
+  val mutable album_artist = ""
+  val mutable album_artist_id = dummy_id
+  val mutable year = 0
+  val mutable number = 0
+  val mutable length = 0.
+  val mutable files = []
+  val mutable cover = None
+  val mutable popularity = 0.
+  val mutable external_ids = []
+  val mutable alternatives = []
+  val mutable cached = None
+
+  method node tag attrs =
+    if cached = None then
+      match tag with
+        | "mlspot-cache-version" -> new data (fun x -> if int_of_string x <> track_cache_version then raise Cache_version_mismatch)
+        | "id" -> new data (fun x -> id <- id_of_string x; cached <- Weak_cache.get tracks id)
+        | "title" -> new data (fun x -> title <- x)
+        | "explicit" -> new data (fun x -> explicit <- bool_of_string x)
+        | "artist" -> new data (fun x -> artists <- x :: artists)
+        | "artist-id" -> new data (fun x -> artists_id <- id_of_string x :: artists_id)
+        | "album" -> new data (fun x -> album <- x)
+        | "album-id" -> new data (fun x -> album_id <- id_of_string x)
+        | "album-artist" -> new data (fun x -> album_artist <- x)
+        | "album-artist-id" -> new data (fun x -> album_artist_id <- id_of_string x)
+        | "year" -> new data (fun x -> year <- int_of_string x)
+        | "track-number" -> new data (fun x -> number <- int_of_string x)
+        | "length" -> new data (fun x -> length <- float_of_string x /. 1000.)
+        | "files" -> new nodes "file" parse_file (fun x -> files <- x)
+        | "cover" -> new data (fun x -> cover <- Some (id_of_string x))
+        | "popularity" -> new data (fun x -> popularity <- float_of_string x)
+        | "external-ids" -> new nodes "external-id" parse_external_id (fun x -> external_ids <- x)
+        | "alternatives" -> new nodes "track" (fun attrs assign -> new alternative_parser assign) (fun x -> alternatives <- x)
+        | _ -> new xml_parser
+    else
+      new xml_parser
+
+  method stop =
+    let track =
+      match cached with
+        | Some track ->
+            track
+        | None ->
+            Weak_cache.find tracks id (fun () -> new track id (Track id) title explicit (List.rev artists) (List.rev artists_id) album album_id album_artist album_artist_id year number length files cover popularity external_ids alternatives)
+    in
+    delay (save_track session track);
+    assign track
+end
+
+class track_parser_from_album session album album_id album_artist album_artist_id year cover assign = object
+  inherit xml_parser
+
+  val mutable id = dummy_id
+  val mutable title = ""
+  val mutable explicit = false
+  val mutable artists = []
+  val mutable artists_id = []
+  val mutable number = 0
+  val mutable length = 0.
+  val mutable files = []
+  val mutable popularity = 0.
+  val mutable external_ids = []
+  val mutable alternatives = []
+  val mutable cached = None
+
+  method node tag attrs =
+    if cached = None then
+      match tag with
+        | "id" -> new data (fun x -> id <- id_of_string x; cached <- Weak_cache.get tracks id)
+        | "title" -> new data (fun x -> title <- x)
+        | "explicit" -> new data (fun x -> explicit <- bool_of_string x)
+        | "artist" -> new data (fun x -> artists <- x :: artists)
+        | "artist-id" -> new data (fun x -> artists_id <- id_of_string x :: artists_id)
+        | "track-number" -> new data (fun x -> number <- int_of_string x)
+        | "length" -> new data (fun x -> length <- float_of_string x /. 1000.)
+        | "files" -> new nodes "file" parse_file (fun x -> files <- x)
+        | "popularity" -> new data (fun x -> popularity <- float_of_string x)
+        | "external-ids" -> new nodes "external-id" parse_external_id (fun x -> external_ids <- x)
+        | "alternatives" -> new nodes "track" (fun attrs assign -> new alternative_parser assign) (fun x -> alternatives <- x)
+        | _ -> new xml_parser
+    else
+      new xml_parser
+
+  method stop =
+    let track =
+      match cached with
+        | Some track ->
+            track
+        | None ->
+            Weak_cache.find tracks id (fun () -> new track id (Track id) title explicit (List.rev artists) (List.rev artists_id) album album_id album_artist album_artist_id year number length files cover popularity external_ids alternatives)
+    in
+    delay (save_track session track);
+    assign id
+end
+
+class disc_parser session album album_id album_artist album_artist_id year cover assign = object
+  inherit xml_parser
+
+  val mutable number = 0
+  val mutable name = None
+  val mutable tracks = []
+
+  method node tag attrs =
+    match tag with
+      | "disc-number" -> new data (fun x -> number <- int_of_string x)
+      | "name" -> new data (fun x -> name <- Some x)
+      | "track" -> new track_parser_from_album session album album_id album_artist album_artist_id year cover (fun id -> tracks <- id :: tracks)
+      | _ -> new xml_parser
+
+  method stop =
+    assign (new disc number name (List.rev tracks))
+end
+
+class disc_parser_from_cache assign = object
+  inherit xml_parser
+
+  val mutable number = 0
+  val mutable name = None
+  val mutable tracks = []
+
+  method node tag attrs =
+    match tag with
+      | "disc-number" -> new data (fun x -> number <- int_of_string x)
+      | "name" -> new data (fun x -> name <- Some x)
+      | "track" -> new data (fun x -> tracks <- id_of_string x :: tracks)
+      | _ -> new xml_parser
+
+  method stop =
+    assign (new disc number name (List.rev tracks))
+end
+
+class copyrights_parser assign = object
+  inherit xml_parser
+
+  val mutable copyrights = []
+
+  method node tag attrs =
+    new data (fun x -> copyrights <- (tag, x) :: copyrights)
+
+  method stop =
+    assign (List.rev copyrights)
+end
+
+let albums = Weak_cache.create 1024
+
+class album_parser session assign = object
+  inherit xml_parser
+
+  val mutable id = dummy_id
+  val mutable name = ""
+  val mutable artist = ""
+  val mutable artist_id = dummy_id
+  val mutable album_type = ""
+  val mutable year = 0
+  val mutable cover = None
+  val mutable copyrights = []
+  val mutable restrictions = []
+  val mutable external_ids = []
+  val mutable discs = []
+  val mutable cached = None
+
+  method node tag attrs =
+    if cached = None then
+      match tag with
+        | "id" -> new data (fun x -> id <- id_of_string x; cached <- Weak_cache.get albums id)
+        | "name" -> new data (fun x -> name <- x)
+        | "artist" -> new data (fun x -> artist <- x)
+        | "artist-id" -> new data (fun x -> artist_id <- id_of_string x)
+        | "album-type" -> new data (fun x -> album_type <- x)
+        | "year" -> new data (fun x -> year <- int_of_string x)
+        | "cover" -> new data (fun x -> cover <- Some (id_of_string x))
+        | "copyright" -> new copyrights_parser (fun x -> copyrights <- x)
+        | "restrictions" -> new nodes "restriction" parse_restriction (fun x -> restrictions <- x)
+        | "external-ids" -> new nodes "external-id" parse_external_id (fun x -> external_ids <- x)
+        | "discs" -> new nodes "disc" (fun attrs assign -> new disc_parser session name id artist artist_id year cover assign) (fun x -> discs <- x)
+        | _ -> new xml_parser
+    else
+      new xml_parser
+
+  method stop =
+    let album =
+      match cached with
+        | Some album ->
+            album
+        | None ->
+            Weak_cache.find albums id (fun () -> new album id (Album id) name artist artist_id album_type year cover copyrights restrictions external_ids discs)
+    in
+    delay (save_album session album);
+    assign album
+end
+
+class album_parser_from_cache assign = object
+  inherit xml_parser
+
+  val mutable id = dummy_id
+  val mutable name = ""
+  val mutable artist = ""
+  val mutable artist_id = dummy_id
+  val mutable album_type = ""
+  val mutable year = 0
+  val mutable cover = None
+  val mutable copyrights = []
+  val mutable restrictions = []
+  val mutable external_ids = []
+  val mutable discs = []
+  val mutable cached = None
+
+  method node tag attrs =
+    if cached = None then
+      match tag with
+        | "mlspot-cache-version" -> new data (fun x -> if int_of_string x <> album_cache_version then raise Cache_version_mismatch)
+        | "id" -> new data (fun x -> id <- id_of_string x; cached <- Weak_cache.get albums id)
+        | "name" -> new data (fun x -> name <- x)
+        | "artist" -> new data (fun x -> artist <- x)
+        | "artist-id" -> new data (fun x -> artist_id <- id_of_string x)
+        | "album-type" -> new data (fun x -> album_type <- x)
+        | "year" -> new data (fun x -> year <- int_of_string x)
+        | "cover" -> new data (fun x -> cover <- Some (id_of_string x))
+        | "copyright" -> new copyrights_parser (fun x -> copyrights <- x)
+        | "restrictions" -> new nodes "restriction" parse_restriction (fun x -> restrictions <- x)
+        | "external-ids" -> new nodes "external-id" parse_external_id (fun x -> external_ids <- x)
+        | "discs" -> new nodes "disc" (fun attrs assign -> new disc_parser_from_cache assign) (fun x -> discs <- x)
+        | _ -> new xml_parser
+    else
+      new xml_parser
+
+  method stop =
+    match cached with
+      | Some album ->
+          assign album
+      | None ->
+          assign (Weak_cache.find albums id (fun () -> new album id (Album id) name artist artist_id album_type year cover copyrights restrictions external_ids discs))
+end
+
+let artists = Weak_cache.create 1024
+
+class artist_parser session assign = object
+  inherit xml_parser
+
+  val mutable id = dummy_id
+  val mutable name = ""
+  val mutable portrait = None
+  val mutable biographies = []
+  val mutable similar_artists = []
+  val mutable genres = []
+  val mutable years_active = []
+  val mutable albums = []
+  val mutable cached = None
+
+  method node tag attrs =
+    if cached = None then
+      match tag with
+        | "id" -> new data (fun x -> id <- id_of_string x; cached <- Weak_cache.get artists id)
+        | "name" -> new data (fun x -> name <- x)
+        | "portrait" -> new portrait_parser (fun x -> portrait <- Some x)
+        | "bios" -> new nodes "bio" (fun attrs assign -> new biography_parser assign) (fun x -> biographies <- x)
+        | "similar-artists" -> new nodes "similar-artist" (fun attrs assign -> new similar_artist_parser assign) (fun x -> similar_artists <- x)
+        | "genres" -> new data (fun x -> genres <- split ',' x)
+        | "years-active" -> new data (fun x -> years_active <- List.map int_of_string (split ',' x))
+        | "albums" -> new nodes "album" (fun attrs assign -> new album_parser session (fun album -> assign album#id)) (fun x -> albums <- x)
+        | _ -> new xml_parser
+    else
+      new xml_parser
+
+  method stop =
+    let artist =
+      match cached with
+        | Some artist ->
+            artist
+        | None ->
+            Weak_cache.find artists id (fun () -> new artist id (Artist id) name portrait biographies similar_artists genres years_active albums)
+    in
+    delay (save_artist session artist);
+    assign artist
+end
+
+class artist_parser_from_cache assign = object
+  inherit xml_parser
+
+  val mutable id = dummy_id
+  val mutable name = ""
+  val mutable portrait = None
+  val mutable biographies = []
+  val mutable similar_artists = []
+  val mutable genres = []
+  val mutable years_active = []
+  val mutable albums = []
+  val mutable cached = None
+
+  method node tag attrs =
+    if cached = None then
+      match tag with
+        | "mlspot-cache-version" -> new data (fun x -> if int_of_string x <> artist_cache_version then raise Cache_version_mismatch)
+        | "id" -> new data (fun x -> id <- id_of_string x; cached <- Weak_cache.get artists id)
+        | "name" -> new data (fun x -> name <- x)
+        | "portrait" -> new portrait_parser (fun x -> portrait <- Some x)
+        | "bios" -> new nodes "bio" (fun attrs assign -> new biography_parser assign) (fun x -> biographies <- x)
+        | "similar-artists" -> new nodes "similar-artist" (fun attrs assign -> new similar_artist_parser assign) (fun x -> similar_artists <- x)
+        | "genres" -> new data (fun x -> genres <- split ',' x)
+        | "years-active" -> new data (fun x -> years_active <- List.map int_of_string (split ',' x))
+        | "albums" -> new nodes "album" (fun attrs assign -> new data (fun x -> assign (id_of_string x))) (fun x -> albums <- x)
+        | _ -> new xml_parser
+    else
+      new xml_parser
+
+  method stop =
+    match cached with
+      | Some x ->
+          assign x
+      | None ->
+          assign (Weak_cache.find artists id (fun () -> new artist id (Artist id) name portrait biographies similar_artists genres years_active albums))
+end
+
+let artist_searchs = Weak_cache.create 1024
+
+class artist_search_parser assign = object
+  inherit xml_parser
+
+  val mutable id = dummy_id
+  val mutable name = ""
+  val mutable portrait = None
+  val mutable popularity = 0.
+  val mutable restrictions = []
+  val mutable cached = None
+
+  method node tag attrs =
+    if cached = None then
+      match tag with
+        | "id" -> new data (fun x -> id <- id_of_string x; cached <- Weak_cache.get artist_searchs id)
+        | "name" -> new data (fun x -> name <- x)
+        | "portrait" -> new portrait_parser (fun x -> portrait <- Some x)
+        | "popularity" -> new data (fun x -> popularity <- float_of_string x)
+        | "restrictions" -> new nodes "restriction" parse_restriction (fun x -> restrictions <- x)
+        | _ -> new xml_parser
+    else
+      new xml_parser
+
+  method stop =
+    match cached with
+      | Some x ->
+          assign x
+      | None ->
+          assign (Weak_cache.find artist_searchs id (fun () -> new artist_search id (Artist id) name portrait popularity restrictions))
+end
+
+let album_searchs = Weak_cache.create 1024
+
+class album_search_parser assign = object
+  inherit xml_parser
+
+  val mutable id = dummy_id
+  val mutable name = ""
+  val mutable artist = ""
+  val mutable artist_id = dummy_id
+  val mutable cover = None
+  val mutable popularity = 0.
+  val mutable restrictions = []
+  val mutable external_ids = []
+  val mutable cached = None
+
+  method node tag attrs =
+    if cached = None then
+      match tag with
+        | "id" -> new data (fun x -> id <- id_of_string x; cached <- Weak_cache.get album_searchs id)
+        | "name" -> new data (fun x -> name <- x)
+        | "artist" -> new data (fun x -> artist <- x)
+        | "artist-id" -> new data (fun x -> artist_id <- id_of_string x)
+        | "cover" -> new data (fun x -> cover <- Some (id_of_string x))
+        | "popularity" -> new data (fun x -> popularity <- float_of_string x)
+        | "restrictions" -> new nodes "restriction" parse_restriction (fun x -> restrictions <- x)
+        | "external-ids" -> new nodes "external-id" parse_external_id (fun x -> external_ids <- x)
+        | _ -> new xml_parser
+    else
+      new xml_parser
+
+  method stop =
+    match cached with
+      | Some x ->
+          assign x
+      | None ->
+          assign (Weak_cache.find album_searchs id (fun () -> new album_search id (Album id) name artist artist_id cover popularity restrictions external_ids))
+end
+
+class search_result_callbacks_parser session query cb_artist cb_album cb_track assign = object
+  inherit xml_parser
+
+  val mutable did_you_mean = None
+  val mutable total_artists = 0
+  val mutable total_albums = 0
+  val mutable total_tracks = 0
+
+  method node tag attrs =
+    match tag with
+      | "did-you-mean" -> new data (fun x -> did_you_mean <- Some x)
+      | "total-artists" -> new data (fun x -> total_artists <- int_of_string x)
+      | "total-albums" -> new data (fun x -> total_albums <- int_of_string x)
+      | "total-tracks" -> new data (fun x -> total_tracks <- int_of_string x)
+      | "artists" -> new nodes "artist" (fun attrs assign -> new artist_search_parser cb_artist) ignore
+      | "albums" -> new nodes "albums" (fun attrs assign -> new album_search_parser cb_album) ignore
+      | "tracks" -> new nodes "tracks" (fun attrs assign -> new track_parser session cb_track) ignore
+      | _ -> new xml_parser
+
+  method stop =
+    assign (new simple_search_result (Search query) did_you_mean total_artists total_albums total_tracks)
+end
+
+class search_result_parser session query assign = object
+  inherit xml_parser
+
+  val mutable did_you_mean = None
+  val mutable total_artists = 0
+  val mutable total_albums = 0
+  val mutable total_tracks = 0
+  val mutable artists = []
+  val mutable albums = []
+  val mutable tracks = []
+
+  method node tag attrs =
+    match tag with
+      | "did-you-mean" -> new data (fun x -> did_you_mean <- Some x)
+      | "total-artists" -> new data (fun x -> total_artists <- int_of_string x)
+      | "total-albums" -> new data (fun x -> total_albums <- int_of_string x)
+      | "total-tracks" -> new data (fun x -> total_tracks <- int_of_string x)
+      | "artists" -> new nodes "artist" (fun attrs assign -> new artist_search_parser assign) (fun x -> artists <- x)
+      | "albums" -> new nodes "album" (fun attrs assign -> new album_search_parser assign) (fun x -> albums <- x)
+      | "tracks" -> new nodes "track" (fun attrs assign -> new track_parser session assign) (fun x -> tracks <- x)
+      | _ -> new xml_parser
+
+  method stop =
+    assign (new search_result (Search query) did_you_mean total_artists total_albums total_tracks artists albums tracks)
+end
 
 (* +-----------------------------------------------------------------+
    | Commands                                                        |
    +-----------------------------------------------------------------+ *)
 
-type fetch_kind = Cache | Fresh
+let save_debug_stream kind stream =
+  if debug then
+    lwt string = string_of_stream stream in
+    delay (save_raw_data kind string);
+    return (new stream_of_string string 0 (String.length string))
+  else
+    return stream
 
-let rec browse session ids kind kind_id root cache_version =
+let rec browse : 'a. session -> id list -> string -> int -> (('a -> unit) -> xml_parser) -> (('a list -> unit) -> xml_parser) -> 'a list Lwt.t = fun session ids kind kind_id cache_parser fresh_parser ->
   if List.exists (fun id -> id_length id <> 16) ids then raise (Wrong_id kind);
-  lwt nodes =
+  (* Try to fetch as much elements as possible from the cache. *)
+  lwt cached, ids =
     Lwt_list.map_p
       (fun id ->
          let filename = make_filename ["metadata"; kind ^ "s"; string_of_id id ^ ".xml.gz"] in
@@ -3099,88 +3453,77 @@ let rec browse session ids kind kind_id root cache_version =
                return (Inr id)
            | Some (file, fd) ->
                try_lwt
-                 lwt node = XML.parse_stream (new inflate_stream (new stream_of_file file fd)) in
-                 try
-                   let node = get_node root node in
-                   let cache_version' = int_of_string (get_data tag_mlspot_cache_version node) in
-                   if cache_version <> cache_version' then begin
+                 let cell = ref None in
+                 lwt x = XML.parse_stream cell (cache_parser (fun x -> cell := Some x)) (new inflate_stream (new stream_of_file file fd)) in
+                 return (Inl x)
+               with
+                 | Cache_version_mismatch ->
                      ignore (Lwt_log.warning_f ~section "the cache file %S does not match the version of mlspot, removing it" filename);
                      lwt () = safe_unlink file in
                      return (Inr id)
-                   end else
-                     return (Inl node)
-                 with _ ->
-                   ignore (Lwt_log.warning_f ~section "the cache file %S does not contains valid data, removing it" filename);
-                   lwt () = safe_unlink file in
-                   return (Inr id)
-               with exn ->
-                 ignore (Lwt_log.warning_f ~section ~exn "failed to read %S from the cache, removing it" filename);
-                 lwt () = safe_unlink file in
-                 return (Inr id)
+                 | exn ->
+                     ignore (Lwt_log.warning_f ~section ~exn "failed to read %S from the cache, removing it" filename);
+                     lwt () = safe_unlink file in
+                     return (Inr id)
                finally
                  Cache.release ();
                  return ())
       ids
+    >|= split_either
   in
-  Lwt_list.map_p
-    (function
-       | Inl node ->
-           return (Cache, node)
-       | Inr id ->
-           lwt channel_id, stream = alloc_channel session#session_parameters in
-           let packet = Packet.create () in
-           Packet.add_int16 packet channel_id;
-           Packet.add_int8 packet kind_id;
-           List.iter (fun id -> Packet.add_string packet (ID.to_bytes id)) ids;
-           if kind_id = 1 || kind_id = 2 then Packet.add_int32 packet 0;
-           lwt () = send_packet session#session_parameters CMD_BROWSE (Packet.contents packet) in
-           lwt node = XML.parse_stream (new inflate_stream stream) in
-           return (Fresh, node))
-    nodes
+  match ids with
+    | [] ->
+        return cached
+    | _ ->
+        (* Fetch the rest from spotify. *)
+        lwt channel_id, stream = alloc_channel session#session_parameters in
+        let packet = Packet.create () in
+        Packet.add_int16 packet channel_id;
+        Packet.add_int8 packet kind_id;
+        List.iter (fun id -> Packet.add_string packet (ID.to_bytes id)) ids;
+        if kind_id = 1 || kind_id = 2 then Packet.add_int32 packet 0;
+        lwt () = send_packet session#session_parameters CMD_BROWSE (Packet.contents packet) in
+        lwt stream = save_debug_stream kind stream in
+        let cell = ref None in
+        try_lwt
+          lwt x = XML.parse_stream cell (fresh_parser (fun x -> cell := Some x)) (new inflate_stream stream) in
+          return (cached @ x)
+        with exn ->
+          ignore (Lwt_log.warning_f ~section ~exn "failex to parse %s XML" kind);
+          raise_lwt exn
 
 and get_artist session id =
   Weak_cache.find_lwt artists id
     (fun () ->
-       match_lwt browse session [id] "artist" 1 tag_artist artist_cache_version with
-         | [(Fresh, node)] ->
-             let artist = safe_parse "artist" (fun () -> make_artist (get_node tag_artist node)) in
-             delay (save_artist session artist);
+       match_lwt
+         browse session [id] "artist" 1
+           (fun assign -> new node "artist" (fun attrs -> new artist_parser_from_cache assign))
+           (fun assign -> new node "artist" (fun attrs -> new artist_parser session (fun x -> assign [x])))
+       with
+         | [artist] ->
              return artist
-         | [(Cache, node)] ->
-             safe_parse "artist" (fun () -> artist_from_cache node (get_album session))
          | _ ->
              assert false)
 
 and get_album session id =
   Weak_cache.find_lwt albums id
     (fun () ->
-       match_lwt browse session [id] "album" 2 tag_album album_cache_version with
-         | [(Fresh, node)] ->
-             let album = safe_parse "album" (fun () -> make_album (get_node tag_album node)) in
-             delay (save_album session album);
+       match_lwt
+         browse session [id] "album" 2
+           (fun assign -> new node "album" (fun attrs -> new album_parser_from_cache assign))
+           (fun assign -> new node "album" (fun attrs -> new album_parser session (fun x -> assign [x])))
+       with
+         | [album] ->
              return album
-         | [(Cache, node)] ->
-             safe_parse "album" (fun () -> album_from_cache node (get_tracks session))
          | _ ->
              assert false)
 
 and get_tracks session ids =
   Weak_cache.find_multiple_lwt tracks ids
     (fun ids ->
-       lwt nodes = browse session ids "track" 3 tag_track track_cache_version in
-       return
-         (List.flatten
-            (List.map
-               (function
-                  | (Fresh, node) ->
-                      let tracks = safe_parse "track" (fun () -> List.map make_track (get_nodes tag_track (get_node tag_tracks (get_node tag_result node)))) in
-                      delay (Lwt_list.iter_s (save_track session) tracks);
-                      tracks
-                  | (Cache, node) ->
-                      [safe_parse "track" (fun () ->
-                                             let id = id_of_string (get_data tag_id node) in
-                                             new track node id)])
-               nodes)))
+       browse session ids "track" 3
+         (fun assign -> new node "track" (fun attrs -> new track_parser session assign))
+         (fun assign -> new node "result" (fun attrs -> new nodes "tracks" (fun attrs assign -> new node "track" (fun attrs -> new track_parser session assign)) assign)))
 
 let get_track session id =
   lwt tracks = get_tracks session [id] in
@@ -3219,10 +3562,25 @@ let search session ?(offset = 0) ?(length = 1000) query =
   Packet.add_int8 packet len;
   Packet.add_string packet query;
   lwt () = send_packet session#session_parameters CMD_SEARCH (Packet.contents packet) in
-  lwt node = XML.parse_stream (new inflate_stream stream) in
-  let search = safe_parse "search result" (fun () -> new search_result query (get_node tag_result node)) in
-  delay (Lwt_list.iter_p (save_track session) search#tracks);
-  return search
+  lwt stream = save_debug_stream "search result" stream in
+  let cell = ref None in
+  XML.parse_stream cell (new node "result" (fun attrs -> new search_result_parser session query (fun x -> cell := Some x))) (new inflate_stream stream)
+
+let search_callbacks session ?(offset = 0) ?(length = 1000) ?(artist = ignore) ?(album = ignore) ?(track = ignore) query =
+  let len = String.length query in
+  if len > 255 then invalid_arg "Spotify.search";
+  lwt channel_id, stream = alloc_channel session#session_parameters in
+  let packet = Packet.create () in
+  Packet.add_int16 packet channel_id;
+  Packet.add_int32 packet offset;
+  Packet.add_int32 packet length;
+  Packet.add_int16 packet 0;
+  Packet.add_int8 packet len;
+  Packet.add_string packet query;
+  lwt () = send_packet session#session_parameters CMD_SEARCH (Packet.contents packet) in
+  lwt stream = save_debug_stream "search result" stream in
+  let cell = ref None in
+  XML.parse_stream cell (new node "result" (fun attrs -> new search_result_callbacks_parser session query artist album track (fun x -> cell := Some x))) (new inflate_stream stream)
 
 (* +-----------------------------------------------------------------+
    | Data fetching                                                   |

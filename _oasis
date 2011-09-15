@@ -49,12 +49,6 @@ Library "mlspot-top"
   FindlibParent: mlspot
   XMETADescription: printers for the toplevel
 
-Library "pa_xml"
-  Install: false
-  Path: syntax
-  Modules: Pa_xml
-  BuildDepends: camlp4.lib, camlp4.quotations.o, camlp4.extend
-
 # +-------------------------------------------------------------------+
 # | Examples                                                          |
 # +-------------------------------------------------------------------+

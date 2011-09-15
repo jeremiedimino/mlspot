@@ -1007,7 +1007,7 @@ class product_parser assign = object
 
   method node tag attrs =
     match tag with
-      | "product-type" -> new data (fun str -> product_type <- str)
+      | "type" -> new data (fun str -> product_type <- str)
       | "expiry" -> new data (fun str -> expiry <- if str = "None" then None else Some (int_of_string str))
       | _ -> new xml_parser
 

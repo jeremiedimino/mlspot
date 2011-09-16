@@ -1023,7 +1023,7 @@ module XML = struct
                                 lwt () = write_string oc " " in
                                 lwt () = write_string oc name in
                                 lwt () = write_string oc "=\"" in
-                                lwt () = write_string oc value in
+                                lwt () = write_cdata oc value 0 0 in
                                 lwt () = write_string oc "\"" in
                                 return ()) attrs in
     lwt () = write_string oc ">\n" in
@@ -1044,7 +1044,7 @@ module XML = struct
                                 lwt () = write_string oc " " in
                                 lwt () = write_string oc name in
                                 lwt () = write_string oc "=\"" in
-                                lwt () = write_string oc value in
+                                lwt () = write_cdata oc value 0 0 in
                                 lwt () = write_string oc "\"" in
                                 return ()) attrs in
     lwt () = write_string oc "/>\n" in

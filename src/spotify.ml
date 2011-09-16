@@ -1600,7 +1600,7 @@ class search_result link did_you_mean total_artists total_albums total_tracks ar
   method tracks : track list = tracks
 end
 
-class playlist id link name user time revision checksum collaborative tracks = object
+class playlist id link name user time revision checksum collaborative destroyed tracks = object
   method id : id = id
   method link : link = link
   method name : string = name
@@ -1609,7 +1609,17 @@ class playlist id link name user time revision checksum collaborative tracks = o
   method revision : int = revision
   method checksum : int = checksum
   method collaborative : bool = collaborative
+  method destroyed : bool = destroyed
   method tracks : id list = tracks
+end
+
+class meta_playlist user time revision checksum collaborative playlists = object
+  method user : string = user
+  method time : float = time
+  method revision : int = revision
+  method checksum : int = checksum
+  method collaborative : bool = collaborative
+  method playlists : id list = playlists
 end
 
 (* +-----------------------------------------------------------------+
@@ -1939,6 +1949,9 @@ type session_parameters = {
 
   playlists : ((unit -> unit) * playlist signal Weak.t) ID_table.t;
   (* All playlist in use. *)
+
+  mutable meta_playlist : ((unit -> unit) * meta_playlist signal Weak.t) option;
+  (* The list of all playlists. *)
 }
 
 (* Sessions are objects so they are comparable and hashable. *)
@@ -2964,16 +2977,18 @@ class playlist_ops_parser assign = object
   inherit xml_parser
 
   val mutable name = ""
+  val mutable destroyed = false
   val mutable tracks = []
 
   method node tag attrs =
     match tag with
       | "name" -> new data (fun x -> name <- x)
       | "add" -> new node "items" (fun attrs -> new data (fun x -> tracks <- List.map (fun str -> id_of_string (String.sub str 0 32))  (split ',' (strip x))))
+      | "destroy" -> destroyed <- true; new xml_parser
       | _ -> new xml_parser
 
   method stop =
-    assign (name, tracks)
+    assign (name, destroyed, tracks)
 end
 
 class playlist_change_parser assign = object
@@ -2982,17 +2997,21 @@ class playlist_change_parser assign = object
   val mutable name = ""
   val mutable user = ""
   val mutable time = 0.
+  val mutable destroyed = false
   val mutable tracks = []
 
   method node tag attrs =
     match tag with
-      | "ops" -> new playlist_ops_parser (fun (name', tracks') -> name <- name'; tracks <- tracks')
+      | "ops" -> new playlist_ops_parser (fun (name', destroyed', tracks') ->
+                                            name <- name';
+                                            destroyed <- destroyed';
+                                            tracks <- tracks')
       | "time" -> new data (fun x -> time <- float_of_string x)
       | "user" -> new data (fun x -> user <- x)
       | _ -> new xml_parser
 
   method stop =
-    assign (name, user, time, tracks)
+    assign (name, user, time, destroyed, tracks)
 end
 
 class playlist_parser id assign = object
@@ -3004,14 +3023,16 @@ class playlist_parser id assign = object
   val mutable revision = 0
   val mutable checksum = 0
   val mutable collaborative = false
+  val mutable destroyed = false
   val mutable tracks = []
 
   method node tag attrs =
     match tag with
-      | "change" -> new playlist_change_parser (fun (name', user', time', tracks') ->
+      | "change" -> new playlist_change_parser (fun (name', user', time', destroyed', tracks') ->
                                                   name <- name';
                                                   user <- user';
                                                   time <- time';
+                                                  destroyed <- destroyed;
                                                   tracks <- tracks')
       | "version" -> new data (fun x ->
                                  match split ',' x with
@@ -3024,7 +3045,37 @@ class playlist_parser id assign = object
       | _ -> new xml_parser
 
   method stop =
-    assign (new playlist id (Playlist (user, id)) name user time revision checksum collaborative tracks)
+    assign (new playlist id (Playlist (user, id)) name user time revision checksum collaborative destroyed tracks)
+end
+
+class meta_playlist_parser assign = object
+  inherit xml_parser
+
+  val mutable user = ""
+  val mutable time = 0.
+  val mutable revision = 0
+  val mutable checksum = 0
+  val mutable collaborative = false
+  val mutable playlists = []
+
+  method node tag attrs =
+    match tag with
+      | "change" -> new playlist_change_parser (fun (name', user', time', destroyed', playlists') ->
+                                                  user <- user';
+                                                  time <- time';
+                                                  playlists <- playlists')
+      | "version" -> new data (fun x ->
+                                 match split ',' x with
+                                   | [revision'; num_tracks'; checksum'; collaborative'] ->
+                                       revision <- int_of_string revision';
+                                       checksum <- int_of_string checksum';
+                                       collaborative <- int_of_string collaborative' <> 0
+                                   | _ ->
+                                       failwith "invalid playlist version")
+      | _ -> new xml_parser
+
+  method stop =
+    assign (new meta_playlist user time revision checksum collaborative playlists)
 end
 
 (* +-----------------------------------------------------------------+
@@ -3142,6 +3193,13 @@ let dispatch sp command payload =
     | CMD_PLAYLIST_CHANGED ->
         if String.length payload <> 17 then
           Lwt_log.error ~section "invalid playlist notification received"
+        else if payload = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" then
+          match sp.meta_playlist with
+            | Some (notify, weak) ->
+                notify ();
+                return ()
+            | None ->
+                return ()
         else begin
           let id = ID.of_bytes (String.sub payload 0 16) in
           match try Some (ID_table.find sp.playlists id) with Not_found -> None with
@@ -3552,6 +3610,7 @@ let login session ~username ~password =
       set_products = session#set_products;
       set_country_code = session#set_country_code;
       playlists = ID_table.create 32;
+      meta_playlist = None;
     } in
 
     (* Start the dispatcher. *)
@@ -3770,6 +3829,61 @@ let get_playlist session id =
               let weak = Weak.create 1 in
               Weak.set weak 0 (Some signal);
               ID_table.add sp.playlists id (notify, weak);
+              return signal
+
+let remove_meta_playlist session () =
+  match session#get_session_parameters with
+    | Some sp ->
+        sp.meta_playlist <- None
+    | None ->
+        ()
+
+let fetch_meta_playlist session =
+  lwt channel_id, stream = alloc_channel session#session_parameters in
+  let packet = Packet.create () in
+  Packet.add_int16 packet channel_id;
+  for i = 1 to 17 do
+    Packet.add_int8 packet 0
+  done;
+  Packet.add_int16 packet 0xffff;
+  Packet.add_int16 packet 0xffff;
+  Packet.add_int32 packet 0;
+  Packet.add_int16 packet 0xffff;
+  Packet.add_int16 packet 0xffff;
+  Packet.add_int8 packet 1;
+  lwt () = send_packet session#session_parameters CMD_GET_DATA_PLAYLIST (Packet.contents packet) in
+  lwt stream = save_debug_stream "meta playlist" stream in
+  let cell = ref None in
+  XML.parse_stream ~buggy_root:true cell (new node "next-change" (fun attrs -> new meta_playlist_parser (fun x -> cell := Some x))) stream
+
+let get_meta_playlist session =
+  match
+    match session#session_parameters.meta_playlist with
+      | Some (notify, weak) ->
+          Weak.get weak 0
+      | None ->
+          None
+  with
+    | Some signal ->
+        return signal
+    | None ->
+        lwt playlist = fetch_meta_playlist session in
+        let sp = session#session_parameters in
+        match
+          match sp.meta_playlist with
+            | Some (notify, weak) ->
+                Weak.get weak 0
+            | None ->
+                None
+        with
+          | Some signal ->
+              return signal
+          | None ->
+              let ev, notify = E.create () in
+              let signal = S.with_finaliser (remove_meta_playlist session) (S.hold playlist (E.map_s (fun () -> fetch_meta_playlist session) ev)) in
+              let weak = Weak.create 1 in
+              Weak.set weak 0 (Some signal);
+              sp.meta_playlist <- Some (notify, weak);
               return signal
 
 (* +-----------------------------------------------------------------+

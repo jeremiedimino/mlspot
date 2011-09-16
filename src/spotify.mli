@@ -347,6 +347,7 @@ class type playlist = object
   method revision : int
   method checksum : int
   method collaborative : bool
+  method destroyed : bool
   method tracks : id list
 end
 
@@ -354,6 +355,18 @@ val get_playlist : session -> id -> playlist React.signal Lwt.t
   (** [get_playlist session id] returns the playlist whose id is
       [id]. [id] must be of length 16. The playlist may change over
       the time. *)
+
+class type meta_playlist = object
+  method user : string
+  method time : float
+  method revision : int
+  method checksum : int
+  method collaborative : bool
+  method playlists : id list
+end
+
+val get_meta_playlist : session -> meta_playlist React.signal Lwt.t
+  (** Returns a playlist which contains all playlists of the user. *)
 
 (** {6 Streams} *)
 

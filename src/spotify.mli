@@ -349,9 +349,11 @@ class type playlist = object
   method collaborative : bool
   method destroyed : bool
   method tracks : id list
+  method changes : unit React.event
+    (** This event occurs when the playlist is modified. *)
 end
 
-val get_playlist : session -> id -> playlist React.signal Lwt.t
+val get_playlist : session -> id -> playlist Lwt.t
   (** [get_playlist session id] returns the playlist whose id is
       [id]. [id] must be of length 16. The playlist may change over
       the time. *)
@@ -363,10 +365,15 @@ class type meta_playlist = object
   method checksum : int
   method collaborative : bool
   method playlists : id list
+  method changes : unit React.event
 end
 
-val get_meta_playlist : session -> meta_playlist React.signal Lwt.t
+val get_meta_playlist : session -> meta_playlist Lwt.t
   (** Returns a playlist which contains all playlists of the user. *)
+
+val modify_playlist : session -> ?name : string -> ?collaborative : bool -> playlist -> unit Lwt.t
+  (** [modify_playlist session ?name ?collaborative playlist] changes
+      the parameters of a playlist. *)
 
 (** {6 Streams} *)
 

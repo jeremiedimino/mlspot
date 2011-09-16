@@ -1052,6 +1052,23 @@ module XML = struct
 
   let write_nodes oc tag writer l =
     write_node oc tag [] (fun oc -> Lwt_list.iter_s (fun x -> writer oc x) l)
+
+  let escape data =
+    let buffer = Buffer.create (String.length data) in
+    for i = 0 to String.length data - 1 do
+      match data.[i] with
+        | '"' ->
+            Buffer.add_string buffer "&quot;"
+        | '<' ->
+            Buffer.add_string buffer "&lt;"
+        | '>' ->
+            Buffer.add_string buffer "&gt;"
+        | '&' ->
+            Buffer.add_string buffer "&amp;"
+        | ch ->
+            Buffer.add_char buffer ch
+    done;
+    Buffer.contents buffer
 end
 
 (* +-----------------------------------------------------------------+
@@ -1600,26 +1617,50 @@ class search_result link did_you_mean total_artists total_albums total_tracks ar
   method tracks : track list = tracks
 end
 
-class playlist id link name user time revision checksum collaborative destroyed tracks = object
-  method id : id = id
-  method link : link = link
-  method name : string = name
-  method user : string = user
-  method time : float = time
-  method revision : int = revision
-  method checksum : int = checksum
-  method collaborative : bool = collaborative
-  method destroyed : bool = destroyed
-  method tracks : id list = tracks
+type playlist_params = {
+  mutable pl_id : id;
+  mutable pl_link : link;
+  mutable pl_name : string;
+  mutable pl_user : string;
+  mutable pl_time : float;
+  mutable pl_revision : int;
+  mutable pl_checksum : int;
+  mutable pl_collaborative : bool;
+  mutable pl_destroyed : bool;
+  mutable pl_tracks : id list;
+}
+
+class playlist params changes = object
+  method id = params.pl_id
+  method link = params.pl_link
+  method name = params.pl_name
+  method user = params.pl_user
+  method time = params.pl_time
+  method revision = params.pl_revision
+  method checksum = params.pl_checksum
+  method collaborative = params.pl_collaborative
+  method destroyed = params.pl_destroyed
+  method tracks = params.pl_tracks
+  method changes : unit event = changes
 end
 
-class meta_playlist user time revision checksum collaborative playlists = object
-  method user : string = user
-  method time : float = time
-  method revision : int = revision
-  method checksum : int = checksum
-  method collaborative : bool = collaborative
-  method playlists : id list = playlists
+type meta_playlist_params = {
+  mutable mpl_user : string;
+  mutable mpl_time : float;
+  mutable mpl_revision : int;
+  mutable mpl_checksum : int;
+  mutable mpl_collaborative : bool;
+  mutable mpl_playlists : id list;
+}
+
+class meta_playlist params changes = object
+  method user = params.mpl_user
+  method time = params.mpl_time
+  method revision = params.mpl_revision
+  method checksum = params.mpl_checksum
+  method collaborative = params.mpl_collaborative
+  method playlists = params.mpl_playlists
+  method changes : unit event = changes
 end
 
 (* +-----------------------------------------------------------------+
@@ -1947,10 +1988,10 @@ type session_parameters = {
   set_country_code : string -> unit;
   (* Set the country code. *)
 
-  playlists : ((unit -> unit) * playlist signal Weak.t) ID_table.t;
+  playlists : ((unit -> unit) * playlist Weak.t) ID_table.t;
   (* All playlist in use. *)
 
-  mutable meta_playlist : ((unit -> unit) * meta_playlist signal Weak.t) option;
+  mutable meta_playlist : ((unit -> unit) * meta_playlist Weak.t) option;
   (* The list of all playlists. *)
 }
 
@@ -3014,68 +3055,47 @@ class playlist_change_parser assign = object
     assign (name, user, time, destroyed, tracks)
 end
 
-class playlist_parser id assign = object
+class playlist_parser params = object
   inherit xml_parser
-
-  val mutable name = ""
-  val mutable user = ""
-  val mutable time = 0.
-  val mutable revision = 0
-  val mutable checksum = 0
-  val mutable collaborative = false
-  val mutable destroyed = false
-  val mutable tracks = []
 
   method node tag attrs =
     match tag with
-      | "change" -> new playlist_change_parser (fun (name', user', time', destroyed', tracks') ->
-                                                  name <- name';
-                                                  user <- user';
-                                                  time <- time';
-                                                  destroyed <- destroyed;
-                                                  tracks <- tracks')
+      | "change" -> new playlist_change_parser (fun (name, user, time, destroyed, tracks) ->
+                                                  params.pl_link <- Playlist (user, params.pl_id);
+                                                  params.pl_name <- name;
+                                                  params.pl_user <- user;
+                                                  params.pl_time <- time;
+                                                  params.pl_destroyed <- destroyed;
+                                                  params.pl_tracks <- tracks)
       | "version" -> new data (fun x ->
                                  match split ',' x with
-                                   | [revision'; num_tracks'; checksum'; collaborative'] ->
-                                       revision <- int_of_string revision';
-                                       checksum <- int_of_string checksum';
-                                       collaborative <- int_of_string collaborative' <> 0
+                                   | [revision; num_tracks; checksum; collaborative] ->
+                                       params.pl_revision <- int_of_string revision;
+                                       params.pl_checksum <- int_of_string checksum;
+                                       params.pl_collaborative <- int_of_string collaborative <> 0
                                    | _ ->
                                        failwith "invalid playlist version")
       | _ -> new xml_parser
-
-  method stop =
-    assign (new playlist id (Playlist (user, id)) name user time revision checksum collaborative destroyed tracks)
 end
 
-class meta_playlist_parser assign = object
+class meta_playlist_parser params = object
   inherit xml_parser
-
-  val mutable user = ""
-  val mutable time = 0.
-  val mutable revision = 0
-  val mutable checksum = 0
-  val mutable collaborative = false
-  val mutable playlists = []
 
   method node tag attrs =
     match tag with
-      | "change" -> new playlist_change_parser (fun (name', user', time', destroyed', playlists') ->
-                                                  user <- user';
-                                                  time <- time';
-                                                  playlists <- playlists')
+      | "change" -> new playlist_change_parser (fun (name, user, time, destroyed, playlists) ->
+                                                  params.mpl_user <- user;
+                                                  params.mpl_time <- time;
+                                                  params.mpl_playlists <- playlists)
       | "version" -> new data (fun x ->
                                  match split ',' x with
-                                   | [revision'; num_tracks'; checksum'; collaborative'] ->
-                                       revision <- int_of_string revision';
-                                       checksum <- int_of_string checksum';
-                                       collaborative <- int_of_string collaborative' <> 0
+                                   | [revision; num_tracks; checksum; collaborative] ->
+                                       params.mpl_revision <- int_of_string revision;
+                                       params.mpl_checksum <- int_of_string checksum;
+                                       params.mpl_collaborative <- int_of_string collaborative <> 0
                                    | _ ->
                                        failwith "invalid playlist version")
       | _ -> new xml_parser
-
-  method stop =
-    assign (new meta_playlist user time revision checksum collaborative playlists)
 end
 
 (* +-----------------------------------------------------------------+
@@ -3795,11 +3815,11 @@ let remove_playlist session id () =
     | None ->
         ()
 
-let fetch_playlist session id =
+let fetch_playlist session params =
   lwt channel_id, stream = alloc_channel session#session_parameters in
   let packet = Packet.create () in
   Packet.add_int16 packet channel_id;
-  Packet.add_string packet (ID.to_bytes id);
+  Packet.add_string packet (ID.to_bytes params.pl_id);
   Packet.add_int8 packet 2;
   Packet.add_int32 packet (-1);
   Packet.add_int32 packet 0;
@@ -3807,27 +3827,39 @@ let fetch_playlist session id =
   Packet.add_int8 packet 1;
   lwt () = send_packet session#session_parameters CMD_GET_DATA_PLAYLIST (Packet.contents packet) in
   lwt stream = save_debug_stream "playlist" stream in
-  let cell = ref None in
-  XML.parse_stream ~buggy_root:true cell (new node "next-change" (fun attrs -> new playlist_parser id (fun x -> cell := Some x))) stream
+  XML.parse_stream ~buggy_root:true (ref (Some ())) (new node "next-change" (fun attrs -> new playlist_parser params)) stream
 
 let get_playlist session id =
   if id_length id <> 16 then raise (Wrong_id "playlist");
   match try Weak.get (snd (ID_table.find session#session_parameters.playlists id)) 0 with Not_found -> None with
-    | Some signal ->
-        return signal
+    | Some playlist ->
+        return playlist
     | None ->
-        lwt playlist = fetch_playlist session id in
+        let params = {
+          pl_id = id;
+          pl_link = Playlist ("", id);
+          pl_name = "";
+          pl_user = "";
+          pl_time = 0.;
+          pl_revision = 0;
+          pl_checksum = 0;
+          pl_collaborative = false;
+          pl_destroyed = false;
+          pl_tracks = [];
+        } in
+        lwt () = fetch_playlist session params in
         let sp = session#session_parameters in
         match try Weak.get (snd (ID_table.find sp.playlists id)) 0 with Not_found -> None with
-          | Some signal ->
-              return signal
+          | Some playlist ->
+              return playlist
           | None ->
               let ev, notify = E.create () in
-              let signal = S.with_finaliser (remove_playlist session id) (S.hold playlist (E.map_s (fun () -> fetch_playlist session id) ev)) in
+              let changes = E.with_finaliser (remove_playlist session id) (E.map_s (fun () -> fetch_playlist session params) ev) in
+              let playlist = new playlist params changes in
               let weak = Weak.create 1 in
-              Weak.set weak 0 (Some signal);
+              Weak.set weak 0 (Some playlist);
               ID_table.add sp.playlists id (notify, weak);
-              return signal
+              return playlist
 
 let remove_meta_playlist session () =
   match session#get_session_parameters with
@@ -3836,7 +3868,7 @@ let remove_meta_playlist session () =
     | None ->
         ()
 
-let fetch_meta_playlist session =
+let fetch_meta_playlist session params =
   lwt channel_id, stream = alloc_channel session#session_parameters in
   let packet = Packet.create () in
   Packet.add_int16 packet channel_id;
@@ -3849,8 +3881,7 @@ let fetch_meta_playlist session =
   Packet.add_int8 packet 1;
   lwt () = send_packet session#session_parameters CMD_GET_DATA_PLAYLIST (Packet.contents packet) in
   lwt stream = save_debug_stream "meta playlist" stream in
-  let cell = ref None in
-  XML.parse_stream ~buggy_root:true cell (new node "next-change" (fun attrs -> new meta_playlist_parser (fun x -> cell := Some x))) stream
+  XML.parse_stream ~buggy_root:true (ref (Some ())) (new node "next-change" (fun attrs -> new meta_playlist_parser params)) stream
 
 let get_meta_playlist session =
   match
@@ -3860,10 +3891,18 @@ let get_meta_playlist session =
       | None ->
           None
   with
-    | Some signal ->
-        return signal
+    | Some meta ->
+        return meta
     | None ->
-        lwt playlist = fetch_meta_playlist session in
+        let params = {
+          mpl_user = "";
+          mpl_time = 0.;
+          mpl_revision = 0;
+          mpl_checksum = 0;
+          mpl_collaborative = false;
+          mpl_playlists = [];
+        } in
+        lwt () = fetch_meta_playlist session params in
         let sp = session#session_parameters in
         match
           match sp.meta_playlist with
@@ -3872,15 +3911,47 @@ let get_meta_playlist session =
             | None ->
                 None
         with
-          | Some signal ->
-              return signal
+          | Some meta ->
+              return meta
           | None ->
               let ev, notify = E.create () in
-              let signal = S.with_finaliser (remove_meta_playlist session) (S.hold playlist (E.map_s (fun () -> fetch_meta_playlist session) ev)) in
+              let changes = E.with_finaliser (remove_meta_playlist session) (E.map_s (fun () -> fetch_meta_playlist session params) ev) in
+              let meta = new meta_playlist params changes in
               let weak = Weak.create 1 in
-              Weak.set weak 0 (Some signal);
+              Weak.set weak 0 (Some meta);
               sp.meta_playlist <- Some (notify, weak);
-              return signal
+              return meta
+
+let modify_playlist session ?name ?collaborative playlist =
+  if id_length playlist#id <> 16 then raise (Wrong_id "playlist");
+  let num_tracks = List.length playlist#tracks in
+  lwt channel_id, stream = alloc_channel session#session_parameters in
+  let packet = Packet.create () in
+  Packet.add_int16 packet channel_id;
+  Packet.add_string packet (ID.to_bytes playlist#id);
+  Packet.add_int8 packet 2;
+  Packet.add_int32 packet playlist#revision;
+  Packet.add_int32 packet num_tracks;
+  Packet.add_int32 packet playlist#checksum;
+  Packet.add_int8 packet (if playlist#collaborative then 1 else 0);
+  Packet.add_int8 packet 3;
+  Packet.add_string packet (Printf.sprintf "<change><ops>%s%s</ops><time>%u</time><user>%s</user></change><version>%010u,%010u,%010u,%u</version>"
+                              (match name with
+                                 | Some name -> Printf.sprintf "<name>%s</name>" (XML.escape name)
+                                 | None -> "")
+                              (match collaborative with
+                                 | Some true -> "<pub>1</pub>"
+                                 | Some false -> "<pub>0</pub>"
+                                 | None -> "")
+                              (int_of_float (Unix.time ()))
+                              (XML.escape playlist#user)
+                              (playlist#revision + 1)
+                              num_tracks
+                              playlist#checksum
+                              (if playlist#collaborative then 1 else 0));
+  lwt () = send_packet session#session_parameters CMD_CHANGE_PLAYLIST (Packet.contents packet) in
+  lwt stream = save_debug_stream "modify playlist" stream in
+  return ()
 
 (* +-----------------------------------------------------------------+
    | Data fetching                                                   |

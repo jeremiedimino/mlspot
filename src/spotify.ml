@@ -387,7 +387,7 @@ end = struct
 
   let add_int32 packet x =
     extend packet 4;
-    String.unsafe_set packet.buf (packet.ofs + 0) (Char.unsafe_chr (x lsr 24));
+    String.unsafe_set packet.buf (packet.ofs + 0) (Char.unsafe_chr (x asr 24));
     String.unsafe_set packet.buf (packet.ofs + 1) (Char.unsafe_chr (x lsr 16));
     String.unsafe_set packet.buf (packet.ofs + 2) (Char.unsafe_chr (x lsr 8));
     String.unsafe_set packet.buf (packet.ofs + 3) (Char.unsafe_chr x);
@@ -3801,11 +3801,9 @@ let fetch_playlist session id =
   Packet.add_int16 packet channel_id;
   Packet.add_string packet (ID.to_bytes id);
   Packet.add_int8 packet 2;
-  Packet.add_int16 packet 0xffff;
-  Packet.add_int16 packet 0xffff;
+  Packet.add_int32 packet (-1);
   Packet.add_int32 packet 0;
-  Packet.add_int16 packet 0xffff;
-  Packet.add_int16 packet 0xffff;
+  Packet.add_int32 packet (-1);
   Packet.add_int8 packet 1;
   lwt () = send_packet session#session_parameters CMD_GET_DATA_PLAYLIST (Packet.contents packet) in
   lwt stream = save_debug_stream "playlist" stream in
@@ -3845,11 +3843,9 @@ let fetch_meta_playlist session =
   for i = 1 to 17 do
     Packet.add_int8 packet 0
   done;
-  Packet.add_int16 packet 0xffff;
-  Packet.add_int16 packet 0xffff;
+  Packet.add_int32 packet (-1);
   Packet.add_int32 packet 0;
-  Packet.add_int16 packet 0xffff;
-  Packet.add_int16 packet 0xffff;
+  Packet.add_int32 packet (-1);
   Packet.add_int8 packet 1;
   lwt () = send_packet session#session_parameters CMD_GET_DATA_PLAYLIST (Packet.contents packet) in
   lwt stream = save_debug_stream "meta playlist" stream in
